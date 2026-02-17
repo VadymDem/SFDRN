@@ -24,73 +24,52 @@ public class MeshController : ControllerBase
         _logger.LogInformation("Received gossip from {SenderId} with {Count} nodes",
             message.SenderNodeId, message.KnownNodes?.Count ?? 0);
 
-        // ✅ Сначала дедуплицируем входящие данные
         if (message.KnownNodes != null)
         {
             var deduplicatedIncoming = message.KnownNodes
                 .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
                 .Select(group =>
                 {
-                    // Предпочитаем реальные ID
                     var realNode = group.FirstOrDefault(n => !n.NodeId.StartsWith("temp-"));
                     return realNode ?? group.OrderByDescending(n => n.LastSeen).First();
                 })
                 .ToList();
 
-            _logger.LogDebug("Deduplicated {Original} incoming nodes to {Final} unique entries",
-                message.KnownNodes.Count, deduplicatedIncoming.Count);
-
-            // Обновляем реестр только дедуплицированными узлами
             foreach (var node in deduplicatedIncoming)
             {
                 if (node.NodeId != _nodeRegistry.LocalNodeId)
-                {
                     _nodeRegistry.UpdateNode(node);
-                }
             }
         }
 
-        // ✅ Получаем все узлы из реестра и дедуплицируем для ответа
         var allNodes = _nodeRegistry.GetAllNodes();
 
-        var deduplicatedNodes = allNodes
+        var nodesToShare = allNodes
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
             .Select(group =>
             {
                 var realNode = group.FirstOrDefault(n => !n.NodeId.StartsWith("temp-"));
                 return realNode ?? group.OrderByDescending(n => n.LastSeen).First();
             })
-            .ToList();
-
-        // ✅ Исключаем себя из списка для отправки
-        var nodesToShare = deduplicatedNodes
             .Where(n => n.NodeId != _nodeRegistry.LocalNodeId)
             .ToList();
 
-        // ✅ Добавляем информацию о себе с правильным статусом
         var localNodeInfo = _nodeRegistry.GetNode(_nodeRegistry.LocalNodeId);
         if (localNodeInfo != null)
         {
-            var localNodeCopy = new NodeInfo
+            nodesToShare.Add(new NodeInfo
             {
                 NodeId = localNodeInfo.NodeId,
                 Region = localNodeInfo.Region,
                 PublicEndpoint = localNodeInfo.PublicEndpoint,
                 Transports = localNodeInfo.Transports,
                 LastSeen = DateTime.UtcNow,
-                Status = NodeStatus.Alive
-            };
-            nodesToShare.Add(localNodeCopy);
+                Status = NodeStatus.Alive,
+                DirectNeighbors = localNodeInfo.DirectNeighbors // ✅
+            });
         }
 
-        _logger.LogDebug("Responding with {Count} deduplicated nodes (including self)", nodesToShare.Count);
-
-        var response = new GossipResponse
-        {
-            KnownNodes = nodesToShare
-        };
-
-        return Ok(response);
+        return Ok(new GossipResponse { KnownNodes = nodesToShare });
     }
 
     [HttpGet("health")]
@@ -98,13 +77,9 @@ public class MeshController : ControllerBase
     {
         var uptime = DateTime.UtcNow - Process.GetCurrentProcess().StartTime.ToUniversalTime();
 
-        // ✅ Дедуплицируем для правильного подсчета
-        var allNodes = _nodeRegistry.GetAllNodes();
-        var uniqueNodes = allNodes
+        var uniqueCount = _nodeRegistry.GetAllNodes()
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
-            .Select(group => group.FirstOrDefault(n => !n.NodeId.StartsWith("temp-"))
-                          ?? group.OrderByDescending(n => n.LastSeen).First())
-            .ToList();
+            .Count();
 
         return Ok(new
         {
@@ -112,7 +87,7 @@ public class MeshController : ControllerBase
             nodeId = _nodeRegistry.LocalNodeId,
             uptime = uptime.ToString(@"hh\:mm\:ss"),
             activeTransports = new[] { "HTTPS", "WebSocket" },
-            knownNodes = uniqueNodes.Count  // ✅ Теперь правильное число
+            knownNodes = uniqueCount
         });
     }
 
@@ -121,25 +96,12 @@ public class MeshController : ControllerBase
     {
         var allNodes = _nodeRegistry.GetAllNodes();
 
-        // ✅ Дедуплицируем узлы по эндпоинту для отображения
         var uniqueNodes = allNodes
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
             .Select(group =>
             {
-                // Предпочитаем реальные имена, самые свежие
                 var realNode = group.FirstOrDefault(n => !n.NodeId.StartsWith("temp-"));
-                var selectedNode = realNode ?? group.OrderByDescending(n => n.LastSeen).First();
-
-                // Логируем если есть дубликаты
-                if (group.Count() > 1)
-                {
-                    _logger.LogWarning("Endpoint {Endpoint} has {Count} duplicate entries: {Ids}",
-                        selectedNode.PublicEndpoint,
-                        group.Count(),
-                        string.Join(", ", group.Select(n => n.NodeId)));
-                }
-
-                return selectedNode;
+                return realNode ?? group.OrderByDescending(n => n.LastSeen).First();
             })
             .OrderBy(n => n.NodeId)
             .ToList();

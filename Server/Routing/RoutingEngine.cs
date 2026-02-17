@@ -26,64 +26,49 @@ public class RoutingEngine
 
     public async Task<ForwardResponse> RoutePacket(PacketEnvelope packet)
     {
-        // Проверка TTL
         if (packet.Ttl <= 0)
         {
             _logger.LogWarning("Packet {PacketId} dropped: TTL expired", packet.PacketId);
-            return new ForwardResponse
-            {
-                Success = false,
-                Message = "TTL expired"
-            };
+            return new ForwardResponse { Success = false, Message = "TTL expired" };
         }
 
-        // Если пакет для нас - сохраняем
+        // Пакет для нас - сохраняем
         if (packet.DestinationNode == _nodeRegistry.LocalNodeId)
         {
             _packetStorage.StorePacket(packet);
             _logger.LogInformation("Packet {PacketId} delivered to local node", packet.PacketId);
-            return new ForwardResponse
-            {
-                Success = true,
-                Message = "Delivered to destination"
-            };
+            return new ForwardResponse { Success = true, Message = "Delivered to destination" };
         }
 
-        // Декрементируем TTL
         packet.Ttl--;
 
-        // Находим живого соседа для форварда
-        var aliveNodes = _nodeRegistry.GetAliveNodes()
-            .Where(n => n.NodeId != _nodeRegistry.LocalNodeId && n.NodeId != packet.SourceNode)
-            .ToList();
+        // ✅ Dijkstra: ищем путь от текущего узла до назначения
+        var nextHopId = FindNextHop(_nodeRegistry.LocalNodeId, packet.DestinationNode);
 
-        if (!aliveNodes.Any())
+        if (nextHopId == null)
         {
-            _logger.LogWarning("Packet {PacketId} dropped: no alive neighbors", packet.PacketId);
-            return new ForwardResponse
-            {
-                Success = false,
-                Message = "No alive neighbors"
-            };
+            _logger.LogWarning("Packet {PacketId} dropped: no route to {Destination}",
+                packet.PacketId, packet.DestinationNode);
+            return new ForwardResponse { Success = false, Message = "No route to destination" };
         }
 
-        // Пытаемся найти узел назначения напрямую
-        var destinationNode = aliveNodes.FirstOrDefault(n => n.NodeId == packet.DestinationNode);
-
-        if (destinationNode == null)
+        var nextHopNode = _nodeRegistry.GetNode(nextHopId);
+        if (nextHopNode == null)
         {
-            // Выбираем случайного живого соседа
-            var random = new Random();
-            destinationNode = aliveNodes[random.Next(aliveNodes.Count)];
+            _logger.LogWarning("Packet {PacketId} dropped: next hop {NextHop} not found in registry",
+                packet.PacketId, nextHopId);
+            return new ForwardResponse { Success = false, Message = "Next hop not found" };
         }
 
-        // Форвардим пакет
+        _logger.LogInformation("Packet {PacketId}: {Source} → {Destination}, next hop: {NextHop}",
+            packet.PacketId, packet.SourceNode, packet.DestinationNode, nextHopId);
+
         try
         {
             var client = _httpClientFactory.CreateClient();
             client.Timeout = TimeSpan.FromSeconds(5);
 
-            var url = $"{destinationNode.PublicEndpoint}/routing/forward";
+            var url = $"{nextHopNode.PublicEndpoint}/routing/forward";
             var content = new StringContent(
                 JsonSerializer.Serialize(packet),
                 System.Text.Encoding.UTF8,
@@ -94,19 +79,21 @@ public class RoutingEngine
             if (response.IsSuccessStatusCode)
             {
                 _logger.LogInformation("Packet {PacketId} forwarded to {NodeId}",
-                    packet.PacketId, destinationNode.NodeId);
+                    packet.PacketId, nextHopId);
 
                 return new ForwardResponse
                 {
                     Success = true,
                     Message = "Forwarded",
-                    NextHop = destinationNode.NodeId
+                    NextHop = nextHopId
                 };
             }
             else
             {
                 _logger.LogWarning("Failed to forward packet {PacketId} to {NodeId}: {StatusCode}",
-                    packet.PacketId, destinationNode.NodeId, response.StatusCode);
+                    packet.PacketId, nextHopId, response.StatusCode);
+
+                _nodeRegistry.MarkNodeDead(nextHopId);
 
                 return new ForwardResponse
                 {
@@ -118,7 +105,9 @@ public class RoutingEngine
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error forwarding packet {PacketId} to {NodeId}",
-                packet.PacketId, destinationNode.NodeId);
+                packet.PacketId, nextHopId);
+
+            _nodeRegistry.MarkNodeDead(nextHopId);
 
             return new ForwardResponse
             {
@@ -126,5 +115,92 @@ public class RoutingEngine
                 Message = $"Forward error: {ex.Message}"
             };
         }
+    }
+
+    // ✅ Dijkstra: возвращает первый шаг на пути от source до destination
+    private string? FindNextHop(string sourceId, string destinationId)
+    {
+        var graph = _nodeRegistry.BuildGraph();
+
+        _logger.LogDebug("Dijkstra graph: {Graph}",
+            string.Join(", ", graph.Select(kv => $"{kv.Key}→[{string.Join(",", kv.Value)}]")));
+
+        if (!graph.ContainsKey(sourceId))
+        {
+            _logger.LogWarning("Source {SourceId} not in graph", sourceId);
+            return null;
+        }
+
+        if (!graph.ContainsKey(destinationId))
+        {
+            _logger.LogWarning("Destination {DestinationId} not in graph", destinationId);
+            return null;
+        }
+
+        // Инициализация
+        var dist = new Dictionary<string, int>();
+        var prev = new Dictionary<string, string?>();
+        var unvisited = new HashSet<string>();
+
+        foreach (var nodeId in graph.Keys)
+        {
+            dist[nodeId] = int.MaxValue;
+            prev[nodeId] = null;
+            unvisited.Add(nodeId);
+        }
+
+        dist[sourceId] = 0;
+
+        while (unvisited.Count > 0)
+        {
+            // Берем узел с минимальной дистанцией
+            var current = unvisited
+                .Where(n => dist.ContainsKey(n))
+                .OrderBy(n => dist[n])
+                .FirstOrDefault();
+
+            if (current == null || dist[current] == int.MaxValue)
+                break;
+
+            if (current == destinationId)
+                break;
+
+            unvisited.Remove(current);
+
+            foreach (var neighbor in graph[current])
+            {
+                if (!unvisited.Contains(neighbor))
+                    continue;
+
+                var alt = dist[current] + 1;
+                if (alt < dist[neighbor])
+                {
+                    dist[neighbor] = alt;
+                    prev[neighbor] = current;
+                }
+            }
+        }
+
+        // Восстанавливаем путь
+        if (prev[destinationId] == null && destinationId != sourceId)
+        {
+            _logger.LogWarning("No path found from {Source} to {Destination}", sourceId, destinationId);
+            return null;
+        }
+
+        // Идем от destination назад до source, находим первый шаг
+        var path = new List<string>();
+        var step = destinationId;
+
+        while (step != null)
+        {
+            path.Insert(0, step);
+            prev.TryGetValue(step, out step);
+        }
+
+        _logger.LogInformation("Route found: {Path}", string.Join(" → ", path));
+
+        // Первый шаг после source
+        return path.Count >= 2 ? path[1] : null;
     }
 }

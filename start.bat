@@ -2,41 +2,50 @@
 chcp 65001 >nul
 echo.
 echo ==========================================
-echo   SFDRN Mesh Network - Starting 3 Nodes
+echo   SFDRN Mesh Network - Starting 5 Nodes
 echo ==========================================
 echo.
+echo Topology:
+echo   Denmark(5000) --- Germany(5001) --- Poland(5002)
+echo                          ^|                  ^|
+echo                      Austria(5003) --- Czech(5004)
+echo.
 
-REM Переходим в папку сервера
 cd /d "%~dp0"
 
-REM Убиваем старые процессы dotnet (если есть)
-echo [1/4] Stopping old SFDRN processes...
+echo [1/6] Stopping old SFDRN processes...
 taskkill /F /IM dotnet.exe >nul 2>&1
 timeout /t 2 >nul
 
-REM Node 1
-echo [2/4] Starting Node 1 (local-01) on port 5000...
-REM Добавлено --no-launch-profile, чтобы игнорировать порты из launchSettings.json и взять наши переменные
-start "SFDRN-Node1" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Node1.json && set ASPNETCORE_URLS=http://localhost:5000 && dotnet run --no-launch-profile > node1.log 2>&1"
-timeout /t 3 >nul
+echo [2/6] Starting Denmark on port 5000...
+start "SFDRN-Denmark" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Denmark.json && set ASPNETCORE_URLS=http://localhost:5000 && dotnet run --no-launch-profile > denmark.log 2>&1"
+timeout /t 2 >nul
 
-REM Node 2
-echo [3/4] Starting Node 2 (local-02) on port 5001...
-start "SFDRN-Node2" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Node2.json && set ASPNETCORE_URLS=http://localhost:5001 && dotnet run --no-launch-profile > node2.log 2>&1"
-timeout /t 3 >nul
+echo [3/6] Starting Germany on port 5001...
+start "SFDRN-Germany" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Germany.json && set ASPNETCORE_URLS=http://localhost:5001 && dotnet run --no-launch-profile > germany.log 2>&1"
+timeout /t 2 >nul
 
-REM Node 3
-echo [4/4] Starting Node 3 (local-03) on port 5002...
-start "SFDRN-Node3" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Node3.json && set ASPNETCORE_URLS=http://localhost:5002 && dotnet run --no-launch-profile > node3.log 2>&1"
+echo [4/6] Starting Poland on port 5002...
+start "SFDRN-Poland" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Poland.json && set ASPNETCORE_URLS=http://localhost:5002 && dotnet run --no-launch-profile > poland.log 2>&1"
+timeout /t 2 >nul
+
+echo [5/6] Starting Austria on port 5003...
+start "SFDRN-Austria" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Austria.json && set ASPNETCORE_URLS=http://localhost:5003 && dotnet run --no-launch-profile > austria.log 2>&1"
+timeout /t 2 >nul
+
+echo [6/6] Starting Czech Republic on port 5004...
+start "SFDRN-Czech" cmd /c "set SFDRN_NODE_CONFIG=appsettings.Czech.json && set ASPNETCORE_URLS=http://localhost:5004 && dotnet run --no-launch-profile > czech.log 2>&1"
 timeout /t 2 >nul
 
 echo.
 echo ==========================================
-echo   All nodes started successfully!
+echo   All nodes started!
 echo ==========================================
 echo.
-echo Node 1 (local-01): http://localhost:5000
-echo Node 2 (local-02): http://localhost:5001
-echo Node 3 (local-03): http://localhost:5002
+echo   Denmark:  http://localhost:5000
+echo   Germany:  http://localhost:5001
+echo   Poland:   http://localhost:5002
+echo   Austria:  http://localhost:5003
+echo   Czech:    http://localhost:5004
 echo.
 pause

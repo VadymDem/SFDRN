@@ -8,6 +8,10 @@ public class NodeInfo
     public List<string> Transports { get; set; } = new();
     public DateTime LastSeen { get; set; } = DateTime.UtcNow;
     public NodeStatus Status { get; set; } = NodeStatus.Unknown;
+
+    // ✅ Прямые соседи этого узла (NodeId -> endpoint)
+    // Используется для построения графа в Dijkstra
+    public List<string> DirectNeighbors { get; set; } = new();
 }
 
 public enum NodeStatus
