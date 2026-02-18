@@ -11,6 +11,9 @@ public class NodeRegistry
     private readonly ILogger<NodeRegistry>? _logger;
     private readonly object _lockObject = new();
 
+    // [ID Клиента] -> [ID Ноды-шлюза]
+    private readonly ConcurrentDictionary<string, string> _clientToNodeMap = new();
+
     public NodeRegistry(NodeConfiguration localConfig, ILogger<NodeRegistry>? logger = null)
     {
         _localConfig = localConfig;
@@ -24,16 +27,62 @@ public class NodeRegistry
             Transports = new List<string> { "HTTPS", "WebSocket" },
             LastSeen = DateTime.UtcNow,
             Status = NodeStatus.Alive,
-            // ✅ Заполняем прямых соседей из конфига
             DirectNeighbors = localConfig.Neighbors.Select(NormalizeUrl).ToList()
         };
         _nodes.TryAdd(localConfig.NodeId, localNode);
+
+        _logger?.LogInformation("Node {NodeId} initialized. Neighbors in config: {Count}",
+            localConfig.NodeId, localConfig.Neighbors.Count);
     }
 
     private static string NormalizeUrl(string url)
     {
         if (string.IsNullOrWhiteSpace(url)) return url;
         return url.Trim().TrimEnd('/').ToLowerInvariant();
+    }
+
+    // --- ЛОГИКА КЛИЕНТОВ ---
+
+    public void UpdateClientLocation(string clientId, string gatewayNodeId)
+    {
+        _clientToNodeMap[clientId] = gatewayNodeId;
+    }
+
+    /// <summary>
+    /// Массовое обновление карты клиентов (при получении Gossip-пакета)
+    /// </summary>
+    public void SyncClientMap(Dictionary<string, string> remoteClientMap)
+    {
+        foreach (var (clientId, gatewayId) in remoteClientMap)
+        {
+            // Обновляем только если это не наш локальный клиент (наша инфа приоритетнее)
+            // И если мы вообще знаем такую ноду-шлюз
+            if (gatewayId != _localConfig.NodeId && _nodes.ContainsKey(gatewayId))
+            {
+                _clientToNodeMap[clientId] = gatewayId;
+            }
+        }
+    }
+
+    public string? GetClientGateway(string clientId)
+    {
+        _clientToNodeMap.TryGetValue(clientId, out var nodeId);
+        return nodeId;
+    }
+
+    public Dictionary<string, string> GetClientMap() => _clientToNodeMap.ToDictionary(k => k.Key, v => v.Value);
+
+    // --- ЛОГИКА НОД ---
+
+    /// <summary>
+    /// Метод для Gossip: обновляет знания о нескольких нодах сразу
+    /// </summary>
+    public void BatchUpdateNodes(IEnumerable<NodeInfo> incomingNodes)
+    {
+        foreach (var node in incomingNodes)
+        {
+            UpdateNode(node);
+        }
     }
 
     public void UpdateNode(NodeInfo nodeInfo)
@@ -43,158 +92,151 @@ public class NodeRegistry
 
         var normalizedEndpoint = NormalizeUrl(nodeInfo.PublicEndpoint);
 
-        // ✅ Игнорируем узлы указывающие на наш endpoint
         if (normalizedEndpoint == NormalizeUrl(_localConfig.PublicEndpoint))
-        {
-            _logger?.LogDebug("Ignoring node {NodeId} pointing to local endpoint", nodeInfo.NodeId);
             return;
-        }
 
         nodeInfo.PublicEndpoint = normalizedEndpoint;
-        nodeInfo.LastSeen = DateTime.UtcNow;
+
+        // Если пришло извне, обновляем время, когда видели
+        if (nodeInfo.LastSeen == default) nodeInfo.LastSeen = DateTime.UtcNow;
 
         lock (_lockObject)
         {
-            var duplicates = _nodes.Values
-                .Where(n => n.NodeId != nodeInfo.NodeId &&
-                            n.NodeId != _localConfig.NodeId &&
-                            NormalizeUrl(n.PublicEndpoint) == normalizedEndpoint)
-                .ToList();
-
-            bool incomingIsReal = !nodeInfo.NodeId.StartsWith("temp-");
-
-            foreach (var dup in duplicates)
-            {
-                bool existingIsReal = !dup.NodeId.StartsWith("temp-");
-                if (incomingIsReal || !existingIsReal)
-                {
-                    if (_nodes.TryRemove(dup.NodeId, out _))
-                    {
-                        _logger?.LogDebug("Removed duplicate node {OldId} replaced by {NewId}",
-                            dup.NodeId, nodeInfo.NodeId);
-                    }
-                }
-            }
-
-            var existing = _nodes.Values.FirstOrDefault(n =>
+            // Проверка дубликатов по Endpoint
+            var existingByEndpoint = _nodes.Values.FirstOrDefault(n =>
                 n.NodeId != _localConfig.NodeId &&
                 NormalizeUrl(n.PublicEndpoint) == normalizedEndpoint);
 
-            if (existing != null)
+            if (existingByEndpoint != null && existingByEndpoint.NodeId != nodeInfo.NodeId)
             {
-                if (!incomingIsReal && !existing.NodeId.StartsWith("temp-"))
-                {
-                    // Temp не обновляет статус real узла
-                    if (nodeInfo.Transports?.Any() == true)
-                        existing.Transports = nodeInfo.Transports;
-                    return;
-                }
+                // Если ID другой, но адрес тот же — удаляем старую запись (перерегистрация ноды)
+                _nodes.TryRemove(existingByEndpoint.NodeId, out _);
+            }
 
-                if (existing.NodeId != nodeInfo.NodeId)
-                    _nodes.TryRemove(existing.NodeId, out _);
+            // Логика защиты статуса Suspicious (не даем сразу стать Alive без проверки)
+            if (_nodes.TryGetValue(nodeInfo.NodeId, out var current) &&
+                current.Status == NodeStatus.Suspicious &&
+                nodeInfo.Status == NodeStatus.Alive)
+            {
+                nodeInfo.Status = NodeStatus.Suspicious;
             }
 
             _nodes.AddOrUpdate(nodeInfo.NodeId, nodeInfo, (_, _) => nodeInfo);
-            _logger?.LogDebug("Updated node {NodeId} ({Endpoint})", nodeInfo.NodeId, nodeInfo.PublicEndpoint);
+
+            // DYNAMIC MESH: Если нода живая и "настоящая", добавляем в список прямых соседей
+            if (!nodeInfo.NodeId.StartsWith("temp-") && nodeInfo.Status == NodeStatus.Alive)
+            {
+                if (_nodes.TryGetValue(_localConfig.NodeId, out var localNode))
+                {
+                    if (!localNode.DirectNeighbors.Contains(normalizedEndpoint))
+                    {
+                        localNode.DirectNeighbors.Add(normalizedEndpoint);
+                        _logger?.LogInformation("Mesh expanded: added neighbor {NodeId}", nodeInfo.NodeId);
+                    }
+                }
+            }
         }
     }
 
-    public NodeInfo? GetNode(string nodeId)
-    {
-        _nodes.TryGetValue(nodeId, out var node);
-        return node;
-    }
+    // --- СТАНДАРТНЫЕ МЕТОДЫ (Get/Mark/Remove) ---
 
-    public List<NodeInfo> GetAllNodes()
-    {
-        lock (_lockObject)
-        {
-            return _nodes.Values.ToList();
-        }
-    }
+    public NodeInfo? GetNode(string nodeId) => _nodes.TryGetValue(nodeId, out var node) ? node : null;
 
-    public List<NodeInfo> GetAliveNodes()
-    {
-        lock (_lockObject)
-        {
-            return _nodes.Values.Where(n => n.Status == NodeStatus.Alive).ToList();
-        }
-    }
+    public List<NodeInfo> GetAllNodes() { lock (_lockObject) return _nodes.Values.ToList(); }
+
+    public List<NodeInfo> GetAliveNodes() { lock (_lockObject) return _nodes.Values.Where(n => n.Status == NodeStatus.Alive).ToList(); }
 
     public void MarkNodeDead(string nodeId)
     {
-        if (nodeId == _localConfig.NodeId)
-            return;
-
+        if (nodeId == _localConfig.NodeId) return;
         lock (_lockObject)
         {
             if (_nodes.TryGetValue(nodeId, out var node))
             {
                 node.Status = NodeStatus.Dead;
-                _logger?.LogWarning("Marked node {NodeId} as dead", nodeId);
+                if (_nodes.TryGetValue(_localConfig.NodeId, out var localNode))
+                    localNode.DirectNeighbors.Remove(NormalizeUrl(node.PublicEndpoint));
+            }
+        }
+    }
+
+    public void MarkNodeSuspicious(string nodeId)
+    {
+        if (nodeId == _localConfig.NodeId) return;
+        lock (_lockObject)
+        {
+            if (_nodes.TryGetValue(nodeId, out var node) && node.Status == NodeStatus.Alive)
+                node.Status = NodeStatus.Suspicious;
+        }
+    }
+
+    public void MarkNodeAlive(string nodeId)
+    {
+        if (nodeId == _localConfig.NodeId) return;
+        lock (_lockObject)
+        {
+            if (_nodes.TryGetValue(nodeId, out var node))
+            {
+                node.Status = NodeStatus.Alive;
+                node.LastSeen = DateTime.UtcNow;
+                if (_nodes.TryGetValue(_localConfig.NodeId, out var localNode))
+                {
+                    var url = NormalizeUrl(node.PublicEndpoint);
+                    if (!localNode.DirectNeighbors.Contains(url)) localNode.DirectNeighbors.Add(url);
+                }
             }
         }
     }
 
     public void UpdateLocalNodeStatus(NodeStatus status)
     {
-        lock (_lockObject)
+        if (_nodes.TryGetValue(_localConfig.NodeId, out var localNode))
         {
-            if (_nodes.TryGetValue(_localConfig.NodeId, out var localNode))
-            {
-                localNode.Status = status;
-                localNode.LastSeen = DateTime.UtcNow;
-                _logger?.LogInformation("Local node status updated to {Status}", status);
-            }
+            localNode.Status = status;
+            localNode.LastSeen = DateTime.UtcNow;
         }
     }
 
     public bool RemoveNode(string nodeId)
     {
-        if (nodeId == _localConfig.NodeId)
-            return false;
-
+        if (nodeId == _localConfig.NodeId) return false;
         lock (_lockObject)
         {
             if (_nodes.TryRemove(nodeId, out var removed))
             {
-                _logger?.LogDebug("Removed node {NodeId} ({Endpoint})", removed.NodeId, removed.PublicEndpoint);
+                if (_nodes.TryGetValue(_localConfig.NodeId, out var localNode))
+                    localNode.DirectNeighbors.Remove(NormalizeUrl(removed.PublicEndpoint));
                 return true;
             }
             return false;
         }
     }
 
-    // ✅ Строим граф для Dijkstra: NodeId -> список NodeId соседей (только Alive)
     public Dictionary<string, List<string>> BuildGraph()
     {
         lock (_lockObject)
         {
             var graph = new Dictionary<string, List<string>>();
             var allNodes = _nodes.Values.ToList();
+            var routingExcluded = new HashSet<string>(
+                allNodes.Where(n => n.Status == NodeStatus.Dead || n.Status == NodeStatus.Suspicious).Select(n => n.NodeId)
+            );
 
             foreach (var node in allNodes)
             {
-                if (node.Status == NodeStatus.Dead)
-                    continue;
+                if (routingExcluded.Contains(node.NodeId)) continue;
+                if (!graph.ContainsKey(node.NodeId)) graph[node.NodeId] = new List<string>();
 
-                if (!graph.ContainsKey(node.NodeId))
-                    graph[node.NodeId] = new List<string>();
-
-                // Находим соседей по DirectNeighbors (сопоставляем endpoint -> NodeId)
                 foreach (var neighborEndpoint in node.DirectNeighbors)
                 {
                     var neighbor = allNodes.FirstOrDefault(n =>
                         NormalizeUrl(n.PublicEndpoint) == NormalizeUrl(neighborEndpoint) &&
-                        n.Status != NodeStatus.Dead);
+                        !routingExcluded.Contains(n.NodeId));
 
                     if (neighbor != null && neighbor.NodeId != node.NodeId)
-                    {
                         graph[node.NodeId].Add(neighbor.NodeId);
-                    }
                 }
             }
-
             return graph;
         }
     }

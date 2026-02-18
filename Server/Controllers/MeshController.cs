@@ -21,9 +21,12 @@ public class MeshController : ControllerBase
     [HttpPost("gossip")]
     public IActionResult ReceiveGossip([FromBody] GossipMessage message)
     {
-        _logger.LogInformation("Received gossip from {SenderId} with {Count} nodes",
-            message.SenderNodeId, message.KnownNodes?.Count ?? 0);
+        _logger.LogInformation("Received gossip from {SenderId}. Nodes: {NodeCount}, Clients: {ClientCount}",
+            message.SenderNodeId,
+            message.KnownNodes?.Count ?? 0,
+            message.ClientMap?.Count ?? 0);
 
+        // 1. Обновляем информацию об узлах
         if (message.KnownNodes != null)
         {
             var deduplicatedIncoming = message.KnownNodes
@@ -35,15 +38,18 @@ public class MeshController : ControllerBase
                 })
                 .ToList();
 
-            foreach (var node in deduplicatedIncoming)
-            {
-                if (node.NodeId != _nodeRegistry.LocalNodeId)
-                    _nodeRegistry.UpdateNode(node);
-            }
+            // Используем BatchUpdate, который мы добавили в NodeRegistry
+            _nodeRegistry.BatchUpdateNodes(deduplicatedIncoming);
         }
 
-        var allNodes = _nodeRegistry.GetAllNodes();
+        // 2. ✅ СИНХРОНИЗАЦИЯ КЛИЕНТОВ
+        if (message.ClientMap != null)
+        {
+            _nodeRegistry.SyncClientMap(message.ClientMap);
+        }
 
+        // 3. Подготавливаем ответ (наши знания о сети)
+        var allNodes = _nodeRegistry.GetAllNodes();
         var nodesToShare = allNodes
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
             .Select(group =>
@@ -65,11 +71,16 @@ public class MeshController : ControllerBase
                 Transports = localNodeInfo.Transports,
                 LastSeen = DateTime.UtcNow,
                 Status = NodeStatus.Alive,
-                DirectNeighbors = localNodeInfo.DirectNeighbors // ✅
+                DirectNeighbors = localNodeInfo.DirectNeighbors
             });
         }
 
-        return Ok(new GossipResponse { KnownNodes = nodesToShare });
+        // Возвращаем и ноды, и нашу карту клиентов
+        return Ok(new GossipResponse
+        {
+            KnownNodes = nodesToShare,
+            ClientMap = _nodeRegistry.GetClientMap() // ✅ Отдаем актуальную карту клиентов
+        });
     }
 
     [HttpGet("health")]

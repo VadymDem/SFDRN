@@ -94,8 +94,9 @@ public class GossipService : BackgroundService
 
     private async Task RetryDeadNodes(CancellationToken cancellationToken)
     {
+        // ✅ Retry для Dead И Suspicious узлов
         var deadNodes = _nodeRegistry.GetAllNodes()
-            .Where(n => n.Status == NodeStatus.Dead &&
+            .Where(n => (n.Status == NodeStatus.Dead || n.Status == NodeStatus.Suspicious) &&
                         n.NodeId != _nodeRegistry.LocalNodeId &&
                         !n.NodeId.StartsWith("temp-"))
             .ToList();
@@ -157,12 +158,14 @@ public class GossipService : BackgroundService
 
     private async Task TryGossipWithNode(NodeInfo target, CancellationToken cancellationToken, List<NodeInfo>? nodesToShare = null)
     {
-        nodesToShare ??= new List<NodeInfo> { CreateLocalNodeCopy() }; // ✅
+        nodesToShare ??= new List<NodeInfo> { CreateLocalNodeCopy() };
 
         var message = new GossipMessage
         {
             SenderNodeId = _nodeRegistry.LocalNodeId,
-            KnownNodes = nodesToShare
+            KnownNodes = nodesToShare,
+            // ✅ Добавляем карту клиентов в сообщение
+            ClientMap = _nodeRegistry.GetClientMap()
         };
 
         try
@@ -183,20 +186,18 @@ public class GossipService : BackgroundService
                 var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
                 var gossipResponse = JsonSerializer.Deserialize<GossipResponse>(responseContent);
 
+                // 1. Синхронизируем ноды (твой существующий код)
                 if (gossipResponse?.KnownNodes != null)
                 {
-                    foreach (var node in gossipResponse.KnownNodes)
-                    {
-                        if (node.NodeId != _nodeRegistry.LocalNodeId)
-                        {
-                            if (node.Status == NodeStatus.Unknown)
-                            {
-                                node.Status = NodeStatus.Alive;
-                                node.LastSeen = DateTime.UtcNow;
-                            }
-                            _nodeRegistry.UpdateNode(node);
-                        }
-                    }
+                    _nodeRegistry.BatchUpdateNodes(gossipResponse.KnownNodes);
+                }
+
+                // 2. ✅ НОВОЕ: Синхронизируем карту клиентов
+                if (gossipResponse?.ClientMap != null)
+                {
+                    _nodeRegistry.SyncClientMap(gossipResponse.ClientMap);
+                    _logger.LogDebug("Synced {Count} clients from {NodeId}",
+                        gossipResponse.ClientMap.Count, target.NodeId);
                 }
 
                 var updatedTargetInfo = gossipResponse?.KnownNodes?
@@ -204,23 +205,16 @@ public class GossipService : BackgroundService
 
                 if (updatedTargetInfo != null)
                 {
-                    updatedTargetInfo.Status = NodeStatus.Alive;
                     updatedTargetInfo.LastSeen = DateTime.UtcNow;
                     _nodeRegistry.UpdateNode(updatedTargetInfo);
+                    _nodeRegistry.MarkNodeAlive(updatedTargetInfo.NodeId);
                     _logger.LogInformation("Gossip successful with {NodeId}", updatedTargetInfo.NodeId);
                 }
                 else
                 {
-                    if (target.Status == NodeStatus.Dead)
-                        _logger.LogInformation("Dead node {NodeId} is back alive!", target.NodeId);
-
-                    var existingTarget = _nodeRegistry.GetNode(target.NodeId);
-                    if (existingTarget != null)
-                    {
-                        existingTarget.Status = NodeStatus.Alive;
-                        existingTarget.LastSeen = DateTime.UtcNow;
-                        _nodeRegistry.UpdateNode(existingTarget);
-                    }
+                    if (target.Status == NodeStatus.Dead || target.Status == NodeStatus.Suspicious)
+                        _logger.LogInformation("Node {NodeId} is back: {OldStatus} -> Alive", target.NodeId, target.Status);
+                    _nodeRegistry.MarkNodeAlive(target.NodeId);
                 }
             }
             else

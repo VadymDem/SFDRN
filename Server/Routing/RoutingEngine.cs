@@ -1,6 +1,8 @@
 ﻿using SFDRN.Server.Mesh;
 using SFDRN.Server.Models;
 using SFDRN.Server.Storage;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
 
 namespace SFDRN.Server.Routing;
@@ -11,6 +13,10 @@ public class RoutingEngine
     private readonly PacketStorage _packetStorage;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<RoutingEngine> _logger;
+
+    private const int HttpTimeoutSeconds = 5;
+    private const int AckTimeoutMs = 5000;
+    private const int MaxRetries = 3;
 
     public RoutingEngine(
         NodeRegistry nodeRegistry,
@@ -24,142 +30,193 @@ public class RoutingEngine
         _logger = logger;
     }
 
+    // =========================================================
+    // PUBLIC: обычная маршрутизация
+    // =========================================================
     public async Task<ForwardResponse> RoutePacket(PacketEnvelope packet)
     {
         if (packet.Ttl <= 0)
         {
             _logger.LogWarning("Packet {PacketId} dropped: TTL expired", packet.PacketId);
-            return new ForwardResponse { Success = false, Message = "TTL expired" };
+            return Fail("TTL expired");
         }
 
-        // Пакет для нас - сохраняем
         if (packet.DestinationNode == _nodeRegistry.LocalNodeId)
         {
-            _packetStorage.StorePacket(packet);
-            _logger.LogInformation("Packet {PacketId} delivered to local node", packet.PacketId);
-            return new ForwardResponse { Success = true, Message = "Delivered to destination" };
+            // Data хранится, Ack не хранится
+            if (packet.Type == PacketType.Data)
+            {
+                _packetStorage.StorePacket(packet);
+            }
+
+            _logger.LogInformation("Packet {PacketId} delivered locally", packet.PacketId);
+            return Success("Delivered to destination");
         }
 
         packet.Ttl--;
 
-        // ✅ Dijkstra: ищем путь от текущего узла до назначения
-        var nextHopId = FindNextHop(_nodeRegistry.LocalNodeId, packet.DestinationNode);
+        var attempted = new HashSet<string>();
 
-        if (nextHopId == null)
+        while (true)
         {
-            _logger.LogWarning("Packet {PacketId} dropped: no route to {Destination}",
-                packet.PacketId, packet.DestinationNode);
-            return new ForwardResponse { Success = false, Message = "No route to destination" };
+            var nextHop = FindNextHop(
+                _nodeRegistry.LocalNodeId,
+                packet.DestinationNode,
+                attempted);
+
+            if (nextHop == null)
+            {
+                var reason = attempted.Any()
+                    ? "No alternative route"
+                    : "No route to destination";
+
+                _logger.LogWarning("Packet {PacketId} dropped: {Reason}",
+                    packet.PacketId, reason);
+
+                return Fail(reason);
+            }
+
+            var node = _nodeRegistry.GetNode(nextHop);
+            if (node == null)
+            {
+                attempted.Add(nextHop);
+                continue;
+            }
+
+            _logger.LogInformation(
+                "Packet {PacketId} {Source}->{Destination}, trying hop {NextHop}",
+                packet.PacketId, packet.SourceNode, packet.DestinationNode, nextHop);
+
+            var forwardResult = await TryForward(node.PublicEndpoint, packet);
+
+            if (forwardResult)
+            {
+                return Success("Forwarded", nextHop);
+            }
+
+            _nodeRegistry.MarkNodeSuspicious(nextHop);
+            attempted.Add(nextHop);
+        }
+    }
+
+    // =========================================================
+    // PUBLIC: отправка с ожиданием ACK (At-Least-Once)
+    // =========================================================
+    public async Task<bool> SendWithAck(PacketEnvelope packet)
+    {
+        for (int attempt = 1; attempt <= MaxRetries; attempt++)
+        {
+            _packetStorage.RegisterPendingAck(packet.PacketId);
+
+            var result = await RoutePacket(packet);
+
+            if (!result.Success)
+                return false;
+
+            var ackTask = _packetStorage.GetPendingAckTask(packet.PacketId);
+
+            if (ackTask != null)
+            {
+                var completed = await Task.WhenAny(
+                    ackTask,
+                    Task.Delay(AckTimeoutMs));
+
+                if (completed == ackTask)
+                {
+                    _logger.LogInformation("ACK received for {PacketId}", packet.PacketId);
+                    return true;
+                }
+            }
+
+            _logger.LogWarning("ACK timeout for {PacketId}, retry {Attempt}",
+                packet.PacketId, attempt);
         }
 
-        var nextHopNode = _nodeRegistry.GetNode(nextHopId);
-        if (nextHopNode == null)
-        {
-            _logger.LogWarning("Packet {PacketId} dropped: next hop {NextHop} not found in registry",
-                packet.PacketId, nextHopId);
-            return new ForwardResponse { Success = false, Message = "Next hop not found" };
-        }
+        _logger.LogError("Delivery failed for {PacketId}", packet.PacketId);
+        return false;
+    }
 
-        _logger.LogInformation("Packet {PacketId}: {Source} → {Destination}, next hop: {NextHop}",
-            packet.PacketId, packet.SourceNode, packet.DestinationNode, nextHopId);
-
+    // =========================================================
+    // HTTP Forward
+    // =========================================================
+    public async Task<bool> TryForward(string endpoint, PacketEnvelope packet)
+    {
         try
         {
             var client = _httpClientFactory.CreateClient();
-            client.Timeout = TimeSpan.FromSeconds(5);
+            client.Timeout = TimeSpan.FromSeconds(HttpTimeoutSeconds);
 
-            var url = $"{nextHopNode.PublicEndpoint}/routing/forward";
+            var url = $"{endpoint}/routing/forward";
+
             var content = new StringContent(
                 JsonSerializer.Serialize(packet),
-                System.Text.Encoding.UTF8,
+                Encoding.UTF8,
                 "application/json");
 
             var response = await client.PostAsync(url, content);
 
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogInformation("Packet {PacketId} forwarded to {NodeId}",
-                    packet.PacketId, nextHopId);
-
-                return new ForwardResponse
-                {
-                    Success = true,
-                    Message = "Forwarded",
-                    NextHop = nextHopId
-                };
+                _logger.LogInformation("Packet {PacketId} forwarded successfully",
+                    packet.PacketId);
+                return true;
             }
-            else
-            {
-                _logger.LogWarning("Failed to forward packet {PacketId} to {NodeId}: {StatusCode}",
-                    packet.PacketId, nextHopId, response.StatusCode);
 
-                _nodeRegistry.MarkNodeDead(nextHopId);
+            _logger.LogWarning("Forward failed: {Status}",
+                response.StatusCode);
 
-                return new ForwardResponse
-                {
-                    Success = false,
-                    Message = $"Forward failed: {response.StatusCode}"
-                };
-            }
+            return false;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error forwarding packet {PacketId} to {NodeId}",
-                packet.PacketId, nextHopId);
-
-            _nodeRegistry.MarkNodeDead(nextHopId);
-
-            return new ForwardResponse
-            {
-                Success = false,
-                Message = $"Forward error: {ex.Message}"
-            };
+            _logger.LogWarning("Transport error: {Message}", ex.Message);
+            return false;
         }
     }
 
-    // ✅ Dijkstra: возвращает первый шаг на пути от source до destination
-    private string? FindNextHop(string sourceId, string destinationId)
+    // =========================================================
+    // DIJKSTRA
+    // =========================================================
+    private string? FindNextHop(
+        string sourceId,
+        string destinationId,
+        HashSet<string>? exclude = null)
     {
         var graph = _nodeRegistry.BuildGraph();
 
-        _logger.LogDebug("Dijkstra graph: {Graph}",
-            string.Join(", ", graph.Select(kv => $"{kv.Key}→[{string.Join(",", kv.Value)}]")));
-
-        if (!graph.ContainsKey(sourceId))
+        if (exclude?.Any() == true)
         {
-            _logger.LogWarning("Source {SourceId} not in graph", sourceId);
-            return null;
+            foreach (var node in exclude)
+            {
+                graph.Remove(node);
+                foreach (var neighbors in graph.Values)
+                    neighbors.Remove(node);
+            }
         }
 
-        if (!graph.ContainsKey(destinationId))
-        {
-            _logger.LogWarning("Destination {DestinationId} not in graph", destinationId);
+        if (!graph.ContainsKey(sourceId) ||
+            !graph.ContainsKey(destinationId))
             return null;
-        }
 
-        // Инициализация
         var dist = new Dictionary<string, int>();
         var prev = new Dictionary<string, string?>();
-        var unvisited = new HashSet<string>();
+        var unvisited = new HashSet<string>(graph.Keys);
 
-        foreach (var nodeId in graph.Keys)
+        foreach (var node in graph.Keys)
         {
-            dist[nodeId] = int.MaxValue;
-            prev[nodeId] = null;
-            unvisited.Add(nodeId);
+            dist[node] = int.MaxValue;
+            prev[node] = null;
         }
 
         dist[sourceId] = 0;
 
         while (unvisited.Count > 0)
         {
-            // Берем узел с минимальной дистанцией
             var current = unvisited
-                .Where(n => dist.ContainsKey(n))
                 .OrderBy(n => dist[n])
-                .FirstOrDefault();
+                .First();
 
-            if (current == null || dist[current] == int.MaxValue)
+            if (dist[current] == int.MaxValue)
                 break;
 
             if (current == destinationId)
@@ -173,6 +230,7 @@ public class RoutingEngine
                     continue;
 
                 var alt = dist[current] + 1;
+
                 if (alt < dist[neighbor])
                 {
                     dist[neighbor] = alt;
@@ -181,14 +239,10 @@ public class RoutingEngine
             }
         }
 
-        // Восстанавливаем путь
-        if (prev[destinationId] == null && destinationId != sourceId)
-        {
-            _logger.LogWarning("No path found from {Source} to {Destination}", sourceId, destinationId);
+        if (prev[destinationId] == null &&
+            destinationId != sourceId)
             return null;
-        }
 
-        // Идем от destination назад до source, находим первый шаг
         var path = new List<string>();
         var step = destinationId;
 
@@ -198,9 +252,56 @@ public class RoutingEngine
             prev.TryGetValue(step, out step);
         }
 
-        _logger.LogInformation("Route found: {Path}", string.Join(" → ", path));
+        _logger.LogInformation("Route: {Path}",
+            string.Join(" → ", path));
 
-        // Первый шаг после source
         return path.Count >= 2 ? path[1] : null;
     }
+
+    public async Task<bool> RouteToClient(string targetGatewayId, PacketEnvelope packet)
+    {
+        // Если целевая нода — это мы сами, значит клиент подключен к нам
+        if (targetGatewayId == _nodeRegistry.LocalNodeId)
+        {
+            // Логика доставки клиенту (через WebSocket) уже должна быть в контроллере
+            // Но для надежности можно вызвать RoutePacket, он поймет, что это Local
+            var res = await RoutePacket(packet);
+            return res.Success;
+        }
+
+        // Если клиент на другой ноде, просим Дейкстру найти путь до ЭТОЙ НОДЫ
+        // Мы создаем "транзитный" поиск: Destination остается клиентским для финальной доставки, 
+        // но путь мы ищем до шлюза.
+
+        _logger.LogInformation("Routing packet {PacketId} to gateway {GatewayId} for client {Client}",
+            packet.PacketId, targetGatewayId, packet.DestinationNode);
+
+        // Вызываем поиск следующего прыжка до ШЛЮЗА
+        var nextHop = FindNextHop(_nodeRegistry.LocalNodeId, targetGatewayId);
+
+        if (nextHop == null) return false;
+
+        var node = _nodeRegistry.GetNode(nextHop);
+        if (node == null) return false;
+
+        return await TryForward(node.PublicEndpoint, packet);
+    }
+
+    // =========================================================
+    // helpers
+    // =========================================================
+    private ForwardResponse Success(string message, string? nextHop = null)
+        => new()
+        {
+            Success = true,
+            Message = message,
+            NextHop = nextHop
+        };
+
+    private ForwardResponse Fail(string message)
+        => new()
+        {
+            Success = false,
+            Message = message
+        };
 }
