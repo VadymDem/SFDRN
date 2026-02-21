@@ -235,6 +235,41 @@ public class ClientController : ControllerBase
             true,
             CancellationToken.None);
     }
+
+
+    // =========================================================
+    // Profile & Discovery
+    // =========================================================
+    [HttpPost("profile")]
+    public IActionResult PublishProfile([FromBody] ClientProfileRequest request)
+    {
+        var profile = new ClientProfile
+        {
+            NodeId = request.NodeId,
+            GlobalNickname = request.GlobalNickname.ToLowerInvariant().Trim(),
+            DisplayName = request.DisplayName,
+            Status = request.Status ?? "Hey! I'm using SFDRN",
+            LastUpdated = DateTime.UtcNow
+        };
+
+        _nodeRegistry.UpdateClientProfile(profile);
+
+        _logger.LogInformation("Profile published: {NodeId} (@{Nickname}) - {Status}",
+            profile.NodeId, profile.GlobalNickname, profile.Status);
+
+        return Ok(new { success = true });
+    }
+
+    [HttpGet("search")]
+    public IActionResult SearchProfiles([FromQuery] string query)
+    {
+        var results = _nodeRegistry.SearchProfiles(query);
+
+        _logger.LogInformation("Profile search: '{Query}' → {Count} results",
+            query, results.Count);
+
+        return Ok(results);
+    }
 }
 
 // =========================================================
@@ -260,4 +295,12 @@ public class ClientMessage
     public string ToNodeId { get; set; } = string.Empty;
     public byte[] Payload { get; set; } = Array.Empty<byte>();
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+}
+
+public class ClientProfileRequest
+{
+    public string NodeId { get; set; } = string.Empty;
+    public string GlobalNickname { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string Status { get; set; } = "Hey! I'm using SFDRN";
 }

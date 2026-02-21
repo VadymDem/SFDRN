@@ -164,8 +164,8 @@ public class GossipService : BackgroundService
         {
             SenderNodeId = _nodeRegistry.LocalNodeId,
             KnownNodes = nodesToShare,
-            // ✅ Добавляем карту клиентов в сообщение
-            ClientMap = _nodeRegistry.GetClientMap()
+            ClientMap = _nodeRegistry.GetClientMap(),
+            Profiles = _nodeRegistry.GetProfiles() // ✅ Добавляем профили
         };
 
         try
@@ -186,18 +186,26 @@ public class GossipService : BackgroundService
                 var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
                 var gossipResponse = JsonSerializer.Deserialize<GossipResponse>(responseContent);
 
-                // 1. Синхронизируем ноды (твой существующий код)
+                // 1. Синхронизируем ноды
                 if (gossipResponse?.KnownNodes != null)
                 {
                     _nodeRegistry.BatchUpdateNodes(gossipResponse.KnownNodes);
                 }
 
-                // 2. ✅ НОВОЕ: Синхронизируем карту клиентов
+                // 2. ✅ Синхронизируем карту клиентов
                 if (gossipResponse?.ClientMap != null)
                 {
                     _nodeRegistry.SyncClientMap(gossipResponse.ClientMap);
-                    _logger.LogDebug("Synced {Count} clients from {NodeId}",
+                    _logger.LogDebug("Synced {Count} client locations from {NodeId}",
                         gossipResponse.ClientMap.Count, target.NodeId);
+                }
+
+                // 3. ✅ Синхронизируем профили (телефонная книга)
+                if (gossipResponse?.Profiles != null)
+                {
+                    _nodeRegistry.SyncProfiles(gossipResponse.Profiles);
+                    _logger.LogDebug("Synced {Count} profiles from {NodeId}",
+                        gossipResponse.Profiles.Count, target.NodeId);
                 }
 
                 var updatedTargetInfo = gossipResponse?.KnownNodes?

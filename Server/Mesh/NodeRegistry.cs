@@ -10,6 +10,8 @@ public class NodeRegistry
     private readonly NodeConfiguration _localConfig;
     private readonly ILogger<NodeRegistry>? _logger;
     private readonly object _lockObject = new();
+    private readonly Dictionary<string, ClientProfile> _clientProfiles = new();
+    private readonly object _profilesLock = new();
 
     // [ID Клиента] -> [ID Ноды-шлюза]
     private readonly ConcurrentDictionary<string, string> _clientToNodeMap = new();
@@ -238,6 +240,74 @@ public class NodeRegistry
                 }
             }
             return graph;
+        }
+    }
+
+    // =========================================================
+    // Профили клиентов (Distributed Phonebook)
+    // =========================================================
+
+    /// <summary>
+    /// Получить все профили для отправки соседям через Gossip
+    /// </summary>
+    public Dictionary<string, ClientProfile> GetProfiles()
+    {
+        lock (_profilesLock)
+        {
+            return _clientProfiles.ToDictionary(k => k.Key, v => v.Value);
+        }
+    }
+
+    /// <summary>
+    /// Локальное обновление профиля (когда клиент публикует свой профиль)
+    /// </summary>
+    public void UpdateClientProfile(ClientProfile profile)
+    {
+        lock (_profilesLock)
+        {
+            _clientProfiles[profile.NodeId] = profile;
+        }
+
+        _logger?.LogDebug("Profile updated locally: {NodeId} (@{Nickname})",
+            profile.NodeId, profile.GlobalNickname);
+    }
+
+    /// <summary>
+    /// Синхронизация профилей из сети (через Gossip, Last-Write-Wins)
+    /// </summary>
+    public void SyncProfiles(Dictionary<string, ClientProfile> remoteProfiles)
+    {
+        lock (_profilesLock)
+        {
+            foreach (var remote in remoteProfiles)
+            {
+                // Если у нас нет этого профиля ИЛИ профиль из сети новее - обновляем
+                if (!_clientProfiles.TryGetValue(remote.Key, out var local) ||
+                    remote.Value.LastUpdated > local.LastUpdated)
+                {
+                    _clientProfiles[remote.Key] = remote.Value;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Поиск профилей по nickname или имени
+    /// </summary>
+    public List<ClientProfile> SearchProfiles(string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return new List<ClientProfile>();
+
+        string lowerQuery = query.ToLowerInvariant().Trim();
+
+        lock (_profilesLock)
+        {
+            return _clientProfiles.Values
+                .Where(p => p.GlobalNickname.Contains(lowerQuery) ||
+                            p.DisplayName.ToLowerInvariant().Contains(lowerQuery))
+                .Take(50)
+                .ToList();
         }
     }
 
