@@ -275,6 +275,7 @@ public class NodeRegistry
         }
     }
 
+
     /// <summary>
     /// Синхронизация профилей из сети (через Gossip, Last-Write-Wins)
     /// </summary>
