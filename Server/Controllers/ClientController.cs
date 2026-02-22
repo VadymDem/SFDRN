@@ -157,22 +157,33 @@ public class ClientController : ControllerBase
             _clientConnections[nodeId] = webSocket;
         }
 
-        // ✅ Сообщаем меш-сети, что клиент теперь активен через НАС
         _nodeRegistry.UpdateClientLocation(nodeId, _nodeRegistry.LocalNodeId);
 
-        _logger.LogInformation("WebSocket connected: {NodeId}. Mesh updated.", nodeId);
+        // ✅ ОТПРАВЛЯЕМ OFFLINE СООБЩЕНИЯ
+        var pendingPackets = _packetStorage.GetPacketsForNode(nodeId);
+        foreach (var packet in pendingPackets)
+        {
+            await SendWebSocketMessage(webSocket, new
+            {
+                type = "new_message",
+                from = packet.SourceNode,
+                packetId = packet.PacketId
+            });
+        }
+
+        _logger.LogInformation("WebSocket connected: {NodeId}. Sent {Count} pending messages.",
+            nodeId, pendingPackets.Count);
 
         try
         {
-            // Отправляем приветствие
             await SendWebSocketMessage(webSocket, new
             {
                 type = "connected",
                 nodeId,
+                gateway = _nodeRegistry.LocalNodeId,
                 timestamp = DateTime.UtcNow
             });
 
-            // Держим соединение открытым и слушаем ping/pong
             var buffer = new byte[1024];
             while (webSocket.State == WebSocketState.Open)
             {
