@@ -277,17 +277,47 @@ public class NodeRegistry
     /// </summary>
     public void SyncProfiles(Dictionary<string, ClientProfile> remoteProfiles)
     {
+        if (remoteProfiles == null || remoteProfiles.Count == 0)
+        {
+            _logger?.LogDebug("SyncProfiles: received empty profile list");
+            return;
+        }
+
+        _logger?.LogInformation("SyncProfiles: received {Count} profiles to sync", remoteProfiles.Count);
+
         lock (_profilesLock)
         {
+            int updated = 0;
+            int skipped = 0;
+
             foreach (var remote in remoteProfiles)
             {
+                _logger?.LogDebug("Processing profile: {NodeId} (@{Nickname})",
+                    remote.Value.NodeId, remote.Value.GlobalNickname);
+
                 // Если у нас нет этого профиля ИЛИ профиль из сети новее - обновляем
-                if (!_clientProfiles.TryGetValue(remote.Key, out var local) ||
-                    remote.Value.LastUpdated > local.LastUpdated)
+                if (!_clientProfiles.TryGetValue(remote.Key, out var local))
                 {
                     _clientProfiles[remote.Key] = remote.Value;
+                    updated++;
+                    _logger?.LogInformation("Added new profile: {NodeId} (@{Nickname})",
+                        remote.Value.NodeId, remote.Value.GlobalNickname);
+                }
+                else if (remote.Value.LastUpdated > local.LastUpdated)
+                {
+                    _clientProfiles[remote.Key] = remote.Value;
+                    updated++;
+                    _logger?.LogInformation("Updated profile: {NodeId} (@{Nickname})",
+                        remote.Value.NodeId, remote.Value.GlobalNickname);
+                }
+                else
+                {
+                    skipped++;
                 }
             }
+
+            _logger?.LogInformation("SyncProfiles complete: {Updated} updated, {Skipped} skipped, total {Total}",
+                updated, skipped, _clientProfiles.Count);
         }
     }
 

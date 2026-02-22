@@ -203,26 +203,24 @@ public class GossipService : BackgroundService
                 // 3. ✅ Синхронизируем профили (телефонная книга)
                 if (gossipResponse?.Profiles != null)
                 {
-                    _nodeRegistry.SyncProfiles(gossipResponse.Profiles);
-                    _logger.LogDebug("Synced {Count} profiles from {NodeId}",
+                    _logger.LogInformation("Received {Count} profiles from {NodeId}, syncing...",
                         gossipResponse.Profiles.Count, target.NodeId);
-                }
 
-                var updatedTargetInfo = gossipResponse?.KnownNodes?
-                    .FirstOrDefault(n => NormalizeUrl(n.PublicEndpoint) == NormalizeUrl(target.PublicEndpoint));
+                    // Проверим что профили реально есть
+                    foreach (var p in gossipResponse.Profiles.Take(3))
+                    {
+                        _logger.LogInformation("  - Profile: {NodeId} (@{Nickname})",
+                            p.Value.NodeId, p.Value.GlobalNickname);
+                    }
 
-                if (updatedTargetInfo != null)
-                {
-                    updatedTargetInfo.LastSeen = DateTime.UtcNow;
-                    _nodeRegistry.UpdateNode(updatedTargetInfo);
-                    _nodeRegistry.MarkNodeAlive(updatedTargetInfo.NodeId);
-                    _logger.LogInformation("Gossip successful with {NodeId}", updatedTargetInfo.NodeId);
+                    _nodeRegistry.SyncProfiles(gossipResponse.Profiles);
+
+                    _logger.LogInformation("Synced {Count} profiles from {NodeId}",
+                        gossipResponse.Profiles.Count, target.NodeId);
                 }
                 else
                 {
-                    if (target.Status == NodeStatus.Dead || target.Status == NodeStatus.Suspicious)
-                        _logger.LogInformation("Node {NodeId} is back: {OldStatus} -> Alive", target.NodeId, target.Status);
-                    _nodeRegistry.MarkNodeAlive(target.NodeId);
+                    _logger.LogWarning("No profiles in gossip response from {NodeId}", target.NodeId);
                 }
             }
             else
