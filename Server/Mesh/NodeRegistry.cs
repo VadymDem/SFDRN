@@ -254,22 +254,25 @@ public class NodeRegistry
     {
         lock (_profilesLock)
         {
+            _logger?.LogInformation("GetProfiles called: returning {Count} profiles", _clientProfiles.Count);
+
+            foreach (var p in _clientProfiles.Take(5))
+            {
+                _logger?.LogInformation("  - {NodeId} (@{Nickname})", p.Value.NodeId, p.Value.GlobalNickname);
+            }
+
             return _clientProfiles.ToDictionary(k => k.Key, v => v.Value);
         }
     }
 
-    /// <summary>
-    /// Локальное обновление профиля (когда клиент публикует свой профиль)
-    /// </summary>
     public void UpdateClientProfile(ClientProfile profile)
     {
         lock (_profilesLock)
         {
             _clientProfiles[profile.NodeId] = profile;
+            _logger?.LogInformation("Profile stored in memory: {NodeId} (@{Nickname}), total: {Count}",
+                profile.NodeId, profile.GlobalNickname, _clientProfiles.Count);
         }
-
-        _logger?.LogDebug("Profile updated locally: {NodeId} (@{Nickname})",
-            profile.NodeId, profile.GlobalNickname);
     }
 
     /// <summary>
