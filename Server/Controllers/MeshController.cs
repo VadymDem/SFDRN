@@ -79,7 +79,8 @@ public class MeshController : ControllerBase
         return Ok(new GossipResponse
         {
             KnownNodes = nodesToShare,
-            ClientMap = _nodeRegistry.GetClientMap() // ✅ Отдаем актуальную карту клиентов
+            Profiles = _nodeRegistry.GetProfiles(),
+            ClientMap = _nodeRegistry.GetClientMap() 
         });
     }
 
