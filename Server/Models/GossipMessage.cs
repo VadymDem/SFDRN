@@ -1,6 +1,4 @@
-﻿using SFDRN.Server.Models;
-
-namespace SFDRN.Server.Mesh;
+﻿namespace SFDRN.Server.Models; 
 
 public class GossipMessage
 {
@@ -8,7 +6,7 @@ public class GossipMessage
     public List<NodeInfo> KnownNodes { get; set; } = new();
     public Dictionary<string, string> ClientMap { get; set; } = new();
 
-    // ✅ Профили клиентов (телефонная книга)
+    // Теперь компилятор точно видит, что это ClientProfile из того же неймспейса
     public Dictionary<string, ClientProfile> Profiles { get; set; } = new();
 }
 
@@ -18,6 +16,5 @@ public class GossipResponse
     public List<NodeInfo>? KnownNodes { get; set; }
     public Dictionary<string, string> ClientMap { get; set; } = new();
 
-    // ✅ Профили клиентов
     public Dictionary<string, ClientProfile> Profiles { get; set; } = new();
 }
