@@ -38,26 +38,24 @@ public class MeshController : ControllerBase
                 })
                 .ToList();
 
-            // Используем BatchUpdate, который мы добавили в NodeRegistry
             _nodeRegistry.BatchUpdateNodes(deduplicatedIncoming);
         }
 
-        // 2. СИНХРОНИЗАЦИЯ КЛИЕНТОВ (уже есть)
+        // 2. Синхронизируем клиентов
         if (message.ClientMap != null)
         {
             _nodeRegistry.SyncClientMap(message.ClientMap);
         }
 
-        // ✅ 3. Синхронизация профилей из входящего сообщения!
+        // 3. Синхронизируем профили (ВХОДЯЩИЕ)
         if (message.Profiles != null)
         {
-            _logger.LogInformation("Received {Count} profiles from {SenderId}. Syncing...",
-                message.Profiles.Count, message.SenderNodeId);
-
+            _logger.LogInformation("Syncing {Count} incoming profiles from {SenderId}...", message.Profiles.Count, message.SenderNodeId);
             _nodeRegistry.SyncProfiles(message.Profiles);
         }
 
-        // 3. Подготавливаем ответ (наши знания о сети)
+        // --- ПОДГОТОВКА ОТВЕТА ---
+
         var allNodes = _nodeRegistry.GetAllNodes();
         var nodesToShare = allNodes
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
@@ -84,13 +82,28 @@ public class MeshController : ControllerBase
             });
         }
 
-        // Возвращаем и ноды, и нашу карту клиентов
-        return Ok(new GossipResponse
+        // ✅ БЕЗОПАСНОЕ СОЗДАНИЕ ОТВЕТА
+        var localProfiles = _nodeRegistry.GetProfiles();
+
+        _logger.LogInformation("Preparing response for {SenderId}. Profiles to send: {Count}",
+            message.SenderNodeId, localProfiles.Count);
+
+        var response = new GossipResponse
         {
+            Success = true,
             KnownNodes = nodesToShare,
-            Profiles = _nodeRegistry.GetProfiles(),
-            ClientMap = _nodeRegistry.GetClientMap() 
-        });
+            // Прямая передача ссылки (словарь уже новый из GetProfiles)
+            Profiles = localProfiles,
+            ClientMap = _nodeRegistry.GetClientMap()
+        };
+
+        // Проверка перед отправкой (страховка)
+        if (response.Profiles == null || response.Profiles.Count == 0)
+        {
+            _logger.LogWarning("CRITICAL: Response profiles are NULL or EMPTY right before sending to {SenderId}!", message.SenderNodeId);
+        }
+
+        return Ok(response);
     }
 
     [HttpGet("health")]
