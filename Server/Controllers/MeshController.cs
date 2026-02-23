@@ -42,10 +42,19 @@ public class MeshController : ControllerBase
             _nodeRegistry.BatchUpdateNodes(deduplicatedIncoming);
         }
 
-        // 2. ✅ СИНХРОНИЗАЦИЯ КЛИЕНТОВ
+        // 2. СИНХРОНИЗАЦИЯ КЛИЕНТОВ (уже есть)
         if (message.ClientMap != null)
         {
             _nodeRegistry.SyncClientMap(message.ClientMap);
+        }
+
+        // ✅ 3. Синхронизация профилей из входящего сообщения!
+        if (message.Profiles != null)
+        {
+            _logger.LogInformation("Received {Count} profiles from {SenderId}. Syncing...",
+                message.Profiles.Count, message.SenderNodeId);
+
+            _nodeRegistry.SyncProfiles(message.Profiles);
         }
 
         // 3. Подготавливаем ответ (наши знания о сети)
