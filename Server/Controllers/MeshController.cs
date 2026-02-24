@@ -13,18 +13,18 @@ public class MeshController : ControllerBase
     private readonly NodeRegistry _nodeRegistry;
     private readonly ILogger<MeshController> _logger;
     private readonly DatabaseService _database;
-    private readonly IServiceProvider _serviceProvider;
+    private readonly IServiceScopeFactory _scopeFactory;  // ✅ Изменено
 
     public MeshController(
         NodeRegistry nodeRegistry,
         ILogger<MeshController> logger,
         DatabaseService database,
-        IServiceProvider serviceProvider)
+        IServiceScopeFactory scopeFactory)  // ✅ Изменено
     {
         _nodeRegistry = nodeRegistry;
         _logger = logger;
         _database = database;
-        _serviceProvider = serviceProvider;
+        _scopeFactory = scopeFactory;  // ✅ Изменено
     }
 
     [HttpPost("gossip")]
@@ -34,9 +34,9 @@ public class MeshController : ControllerBase
             message.SenderNodeId,
             message.KnownNodes?.Count ?? 0,
             message.ClientMap?.Count ?? 0,
-            message.ProfileDigests?.Count ?? 0);  // ✅ Изменено на Digests
+            message.ProfileDigests?.Count ?? 0);
 
-        // 1. Обновляем информацию об узлах (без изменений)
+        // 1. Обновляем информацию об узлах
         if (message.KnownNodes != null)
         {
             var deduplicatedIncoming = message.KnownNodes
@@ -51,20 +51,18 @@ public class MeshController : ControllerBase
             _nodeRegistry.BatchUpdateNodes(deduplicatedIncoming);
         }
 
-        // 2. Синхронизация клиентов (без изменений)
+        // 2. Синхронизация клиентов
         if (message.ClientMap != null)
         {
             _nodeRegistry.SyncClientMap(message.ClientMap);
         }
 
-        // 3. ✅ НОВОЕ: Обработка дайджестов профилей
+        // 3. Обработка дайджестов профилей
         if (message.ProfileDigests != null && message.ProfileDigests.Any())
         {
             _logger.LogInformation("Processing {Count} profile digests from {SenderId}",
                 message.ProfileDigests.Count, message.SenderNodeId);
 
-            // Асинхронно проверяем какие профили нам нужны и запрашиваем их
-            // (не блокируем ответ на Gossip)
             _ = Task.Run(async () =>
             {
                 try
@@ -75,10 +73,8 @@ public class MeshController : ControllerBase
                         var senderNode = _nodeRegistry.GetNode(message.SenderNodeId);
                         if (senderNode != null)
                         {
-                            // ✅ Получаем ProfileSyncService через IServiceProvider
-                            using var scope = _serviceProvider.CreateScope();
+                            using var scope = _scopeFactory.CreateScope();  // ✅ Исправлено
                             var syncService = scope.ServiceProvider.GetRequiredService<ProfileSyncService>();
-
                             await syncService.PullProfilesBatchAsync(missingIds, senderNode.PublicEndpoint);
                         }
                     }
@@ -117,7 +113,6 @@ public class MeshController : ControllerBase
             });
         }
 
-        // ✅ Возвращаем дайджесты вместо полных профилей
         var profileDigests = await _database.GetProfileDigestsAsync();
 
         return Ok(new GossipResponse
@@ -125,7 +120,7 @@ public class MeshController : ControllerBase
             Success = true,
             KnownNodes = nodesToShare,
             ClientMap = _nodeRegistry.GetClientMap(),
-            ProfileDigests = profileDigests  // ✅ Дайджесты вместо Profiles
+            ProfileDigests = profileDigests
         });
     }
 
@@ -133,14 +128,11 @@ public class MeshController : ControllerBase
     public async Task<IActionResult> GetProfile(string nodeId)
     {
         _logger.LogInformation("Profile pull request for {NodeId}", nodeId);
-
         var profile = await _database.GetProfileAsync(nodeId);
-
         if (profile == null)
         {
             return NotFound(new { error = "Profile not found", nodeId });
         }
-
         return Ok(profile);
     }
 
@@ -148,10 +140,8 @@ public class MeshController : ControllerBase
     public async Task<IActionResult> GetProfilesBatch([FromBody] List<string> nodeIds)
     {
         _logger.LogInformation("Batch profile pull request for {Count} profiles", nodeIds.Count);
-
         var profiles = new List<ClientProfile>();
-
-        foreach (var nodeId in nodeIds.Take(100)) // Лимит 100 профилей за раз
+        foreach (var nodeId in nodeIds.Take(100))
         {
             var profile = await _database.GetProfileAsync(nodeId);
             if (profile != null)
@@ -159,9 +149,7 @@ public class MeshController : ControllerBase
                 profiles.Add(profile);
             }
         }
-
         _logger.LogInformation("Returning {Count} profiles", profiles.Count);
-
         return Ok(profiles);
     }
 
@@ -169,11 +157,9 @@ public class MeshController : ControllerBase
     public IActionResult Health()
     {
         var uptime = DateTime.UtcNow - Process.GetCurrentProcess().StartTime.ToUniversalTime();
-
         var uniqueCount = _nodeRegistry.GetAllNodes()
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
             .Count();
-
         return Ok(new
         {
             status = "healthy",
@@ -188,7 +174,6 @@ public class MeshController : ControllerBase
     public IActionResult GetNetworkSnapshot()
     {
         var allNodes = _nodeRegistry.GetAllNodes();
-
         var uniqueNodes = allNodes
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
             .Select(group =>
@@ -198,7 +183,6 @@ public class MeshController : ControllerBase
             })
             .OrderBy(n => n.NodeId)
             .ToList();
-
         return Ok(new
         {
             localNodeId = _nodeRegistry.LocalNodeId,
