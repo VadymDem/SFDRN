@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using SFDRN.Server.Mesh;
 using SFDRN.Server.Models;
+using SFDRN.Server.Services;
 using System.Diagnostics;
 
 namespace SFDRN.Server.Controllers;
@@ -11,22 +12,31 @@ public class MeshController : ControllerBase
 {
     private readonly NodeRegistry _nodeRegistry;
     private readonly ILogger<MeshController> _logger;
+    private readonly DatabaseService _database;
+    private readonly IServiceProvider _serviceProvider;
 
-    public MeshController(NodeRegistry nodeRegistry, ILogger<MeshController> logger)
+    public MeshController(
+        NodeRegistry nodeRegistry,
+        ILogger<MeshController> logger,
+        DatabaseService database,
+        IServiceProvider serviceProvider)
     {
         _nodeRegistry = nodeRegistry;
         _logger = logger;
+        _database = database;
+        _serviceProvider = serviceProvider;
     }
 
     [HttpPost("gossip")]
-    public IActionResult ReceiveGossip([FromBody] GossipMessage message)
+    public async Task<IActionResult> ReceiveGossip([FromBody] GossipMessage message)
     {
-        _logger.LogInformation("Received gossip from {SenderId}. Nodes: {NodeCount}, Clients: {ClientCount}",
+        _logger.LogInformation("Received gossip from {SenderId}. Nodes: {NodeCount}, Clients: {ClientCount}, Digests: {DigestCount}",
             message.SenderNodeId,
             message.KnownNodes?.Count ?? 0,
-            message.ClientMap?.Count ?? 0);
+            message.ClientMap?.Count ?? 0,
+            message.ProfileDigests?.Count ?? 0);  // ✅ Изменено на Digests
 
-        // 1. Обновляем информацию об узлах
+        // 1. Обновляем информацию об узлах (без изменений)
         if (message.KnownNodes != null)
         {
             var deduplicatedIncoming = message.KnownNodes
@@ -41,21 +51,46 @@ public class MeshController : ControllerBase
             _nodeRegistry.BatchUpdateNodes(deduplicatedIncoming);
         }
 
-        // 2. Синхронизируем клиентов
+        // 2. Синхронизация клиентов (без изменений)
         if (message.ClientMap != null)
         {
             _nodeRegistry.SyncClientMap(message.ClientMap);
         }
 
-        // 3. Синхронизируем профили (ВХОДЯЩИЕ)
-        if (message.Profiles != null)
+        // 3. ✅ НОВОЕ: Обработка дайджестов профилей
+        if (message.ProfileDigests != null && message.ProfileDigests.Any())
         {
-            _logger.LogInformation("Syncing {Count} incoming profiles from {SenderId}...", message.Profiles.Count, message.SenderNodeId);
-            _nodeRegistry.SyncProfiles(message.Profiles);
+            _logger.LogInformation("Processing {Count} profile digests from {SenderId}",
+                message.ProfileDigests.Count, message.SenderNodeId);
+
+            // Асинхронно проверяем какие профили нам нужны и запрашиваем их
+            // (не блокируем ответ на Gossip)
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var missingIds = await _database.GetMissingProfileIdsAsync(message.ProfileDigests);
+                    if (missingIds.Any())
+                    {
+                        var senderNode = _nodeRegistry.GetNode(message.SenderNodeId);
+                        if (senderNode != null)
+                        {
+                            // ✅ Получаем ProfileSyncService через IServiceProvider
+                            using var scope = _serviceProvider.CreateScope();
+                            var syncService = scope.ServiceProvider.GetRequiredService<ProfileSyncService>();
+
+                            await syncService.PullProfilesBatchAsync(missingIds, senderNode.PublicEndpoint);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to pull profiles from {SenderId}", message.SenderNodeId);
+                }
+            });
         }
 
-        // --- ПОДГОТОВКА ОТВЕТА ---
-
+        // 4. Подготавливаем ответ
         var allNodes = _nodeRegistry.GetAllNodes();
         var nodesToShare = allNodes
             .GroupBy(n => NormalizeUrl(n.PublicEndpoint))
@@ -82,28 +117,52 @@ public class MeshController : ControllerBase
             });
         }
 
-        // ✅ БЕЗОПАСНОЕ СОЗДАНИЕ ОТВЕТА
-        var localProfiles = _nodeRegistry.GetProfiles();
+        // ✅ Возвращаем дайджесты вместо полных профилей
+        var profileDigests = await _database.GetProfileDigestsAsync();
 
-        _logger.LogInformation("Preparing response for {SenderId}. Profiles to send: {Count}",
-            message.SenderNodeId, localProfiles.Count);
-
-        var response = new GossipResponse
+        return Ok(new GossipResponse
         {
             Success = true,
             KnownNodes = nodesToShare,
-            // Прямая передача ссылки (словарь уже новый из GetProfiles)
-            Profiles = localProfiles,
-            ClientMap = _nodeRegistry.GetClientMap()
-        };
+            ClientMap = _nodeRegistry.GetClientMap(),
+            ProfileDigests = profileDigests  // ✅ Дайджесты вместо Profiles
+        });
+    }
 
-        // Проверка перед отправкой (страховка)
-        if (response.Profiles == null || response.Profiles.Count == 0)
+    [HttpGet("profile/{nodeId}")]
+    public async Task<IActionResult> GetProfile(string nodeId)
+    {
+        _logger.LogInformation("Profile pull request for {NodeId}", nodeId);
+
+        var profile = await _database.GetProfileAsync(nodeId);
+
+        if (profile == null)
         {
-            _logger.LogWarning("CRITICAL: Response profiles are NULL or EMPTY right before sending to {SenderId}!", message.SenderNodeId);
+            return NotFound(new { error = "Profile not found", nodeId });
         }
 
-        return Ok(response);
+        return Ok(profile);
+    }
+
+    [HttpPost("profiles/batch")]
+    public async Task<IActionResult> GetProfilesBatch([FromBody] List<string> nodeIds)
+    {
+        _logger.LogInformation("Batch profile pull request for {Count} profiles", nodeIds.Count);
+
+        var profiles = new List<ClientProfile>();
+
+        foreach (var nodeId in nodeIds.Take(100)) // Лимит 100 профилей за раз
+        {
+            var profile = await _database.GetProfileAsync(nodeId);
+            if (profile != null)
+            {
+                profiles.Add(profile);
+            }
+        }
+
+        _logger.LogInformation("Returning {Count} profiles", profiles.Count);
+
+        return Ok(profiles);
     }
 
     [HttpGet("health")]

@@ -265,6 +265,14 @@ ServiceFabricBackup/
 *.mdf
 *.ldf
 *.ndf
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Migrations - ignore contents, but not the folder
+**/Migrations/*
+!**/Migrations/.gitkeep
 
 # Business Intelligence projects
 *.rdl.data

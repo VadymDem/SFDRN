@@ -13,17 +13,23 @@ public class GossipService : BackgroundService
     private readonly TimeSpan _gossipInterval = TimeSpan.FromSeconds(10);
     private readonly TimeSpan _deadNodeRetryInterval = TimeSpan.FromMinutes(1);
     private readonly Dictionary<string, DateTime> _lastRetryAttempt = new();
+    private readonly DatabaseService _database;
+    private readonly ProfileSyncService _profileSync;
 
     public GossipService(
         NodeRegistry nodeRegistry,
         NodeConfiguration config,
         IHttpClientFactory httpClientFactory,
-        ILogger<GossipService> logger)
+        ILogger<GossipService> logger,
+        DatabaseService database,           // ✅ Добавлено
+        ProfileSyncService profileSync)     // ✅ Добавлено
     {
         _nodeRegistry = nodeRegistry;
         _config = config;
         _httpClientFactory = httpClientFactory;
         _logger = logger;
+        _database = database;               // ✅ Добавлено
+        _profileSync = profileSync;         // ✅ Добавлено
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -160,12 +166,15 @@ public class GossipService : BackgroundService
     {
         nodesToShare ??= new List<NodeInfo> { CreateLocalNodeCopy() };
 
+        // ✅ ИЗМЕНЕНО: получаем дайджесты из БД вместо полных профилей
+        var profileDigests = await _database.GetProfileDigestsAsync();
+
         var message = new GossipMessage
         {
             SenderNodeId = _nodeRegistry.LocalNodeId,
             KnownNodes = nodesToShare,
             ClientMap = _nodeRegistry.GetClientMap(),
-            Profiles = _nodeRegistry.GetProfiles() // ✅ Добавляем профили
+            ProfileDigests = profileDigests  // ✅ Дайджесты вместо Profiles
         };
 
         try
@@ -186,41 +195,66 @@ public class GossipService : BackgroundService
                 var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
                 var gossipResponse = JsonSerializer.Deserialize<GossipResponse>(responseContent);
 
-                // 1. Синхронизируем ноды
+                // 1. Синхронизируем ноды (без изменений)
                 if (gossipResponse?.KnownNodes != null)
                 {
                     _nodeRegistry.BatchUpdateNodes(gossipResponse.KnownNodes);
                 }
 
-                // 2. ✅ Синхронизируем карту клиентов
+                // 2. Синхронизируем карту клиентов (без изменений)
                 if (gossipResponse?.ClientMap != null)
                 {
                     _nodeRegistry.SyncClientMap(gossipResponse.ClientMap);
-                    _logger.LogDebug("Synced {Count} client locations from {NodeId}",
+                    _logger.LogInformation("Synced {Count} client locations from {NodeId}",
                         gossipResponse.ClientMap.Count, target.NodeId);
                 }
 
-                // 3. ✅ Синхронизируем профили (телефонная книга)
-                if (gossipResponse?.Profiles != null)
+                // 3. ✅ НОВОЕ: Pull-based синхронизация профилей
+                if (gossipResponse?.ProfileDigests != null && gossipResponse.ProfileDigests.Any())
                 {
-                    _logger.LogInformation("Received {Count} profiles from {NodeId}, syncing...",
-                        gossipResponse.Profiles.Count, target.NodeId);
+                    _logger.LogInformation("Received {Count} profile digests from {NodeId}",
+                        gossipResponse.ProfileDigests.Count, target.NodeId);
 
-                    // Проверим что профили реально есть
-                    foreach (var p in gossipResponse.Profiles.Take(3))
+                    // Определяем какие профили нам нужны
+                    var missingIds = await _database.GetMissingProfileIdsAsync(gossipResponse.ProfileDigests);
+
+                    if (missingIds.Any())
                     {
-                        _logger.LogInformation("  - Profile: {NodeId} (@{Nickname})",
-                            p.Value.NodeId, p.Value.GlobalNickname);
+                        _logger.LogInformation("Need to pull {Count} profiles from {NodeId}",
+                            missingIds.Count, target.NodeId);
+
+                        // Pull профилей пакетом (асинхронно, не блокируем Gossip)
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await _profileSync.PullProfilesBatchAsync(missingIds, target.PublicEndpoint);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Failed to pull {Count} profiles from {NodeId}",
+                                    missingIds.Count, target.NodeId);
+                            }
+                        });
                     }
+                }
 
-                    _nodeRegistry.SyncProfiles(gossipResponse.Profiles);
+                // Остальная логика без изменений...
+                var updatedTargetInfo = gossipResponse?.KnownNodes?
+                    .FirstOrDefault(n => NormalizeUrl(n.PublicEndpoint) == NormalizeUrl(target.PublicEndpoint));
 
-                    _logger.LogInformation("Synced {Count} profiles from {NodeId}",
-                        gossipResponse.Profiles.Count, target.NodeId);
+                if (updatedTargetInfo != null)
+                {
+                    updatedTargetInfo.LastSeen = DateTime.UtcNow;
+                    _nodeRegistry.UpdateNode(updatedTargetInfo);
+                    _nodeRegistry.MarkNodeAlive(updatedTargetInfo.NodeId);
+                    _logger.LogInformation("Gossip successful with {NodeId}", updatedTargetInfo.NodeId);
                 }
                 else
                 {
-                    _logger.LogWarning("No profiles in gossip response from {NodeId}", target.NodeId);
+                    if (target.Status == NodeStatus.Dead || target.Status == NodeStatus.Suspicious)
+                        _logger.LogInformation("Node {NodeId} is back: {OldStatus} -> Alive", target.NodeId, target.Status);
+                    _nodeRegistry.MarkNodeAlive(target.NodeId);
                 }
             }
             else

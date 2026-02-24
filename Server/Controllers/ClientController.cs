@@ -2,6 +2,7 @@
 using SFDRN.Server.Mesh;
 using SFDRN.Server.Models;
 using SFDRN.Server.Routing;
+using SFDRN.Server.Services;
 using SFDRN.Server.Storage;
 using System.Net.WebSockets;
 using System.Text;
@@ -17,6 +18,8 @@ public class ClientController : ControllerBase
     private readonly PacketStorage _packetStorage;
     private readonly NodeRegistry _nodeRegistry;
     private readonly ILogger<ClientController> _logger;
+    private readonly DatabaseService _database;
+    private readonly ProfileSyncService _profileSync;
 
     // ✅ Активные WebSocket соединения клиентов
     private static readonly Dictionary<string, WebSocket> _clientConnections = new();
@@ -26,12 +29,16 @@ public class ClientController : ControllerBase
         RoutingEngine routingEngine,
         PacketStorage packetStorage,
         NodeRegistry nodeRegistry,
-        ILogger<ClientController> logger)
+        ILogger<ClientController> logger,
+        DatabaseService database,           // ✅ Добавлено
+        ProfileSyncService profileSync)     // ✅ Добавлено
     {
         _routingEngine = routingEngine;
         _packetStorage = packetStorage;
         _nodeRegistry = nodeRegistry;
         _logger = logger;
+        _database = database;               // ✅ Добавлено
+        _profileSync = profileSync;         // ✅ Добавлено
     }
 
     // =========================================================
@@ -248,11 +255,8 @@ public class ClientController : ControllerBase
     }
 
 
-    // =========================================================
-    // Profile & Discovery
-    // =========================================================
     [HttpPost("profile")]
-    public IActionResult PublishProfile([FromBody] ClientProfileRequest request)
+    public async Task<IActionResult> PublishProfile([FromBody] ClientProfileRequest request)
     {
         var profile = new ClientProfile
         {
@@ -263,21 +267,73 @@ public class ClientController : ControllerBase
             LastUpdated = DateTime.UtcNow
         };
 
-        _nodeRegistry.UpdateClientProfile(profile);
+        // ✅ Сохраняем в БД вместо in-memory
+        var saved = await _database.SaveProfileAsync(profile);
 
-        _logger.LogInformation("Profile published: {NodeId} (@{Nickname}) - {Status}",
-            profile.NodeId, profile.GlobalNickname, profile.Status);
+        if (saved)
+        {
+            _logger.LogInformation("Profile published: {NodeId} (@{Nickname}) - {Status}",
+                profile.NodeId, profile.GlobalNickname, profile.Status);
+        }
 
-        return Ok(new { success = true });
+        return Ok(new { success = saved });
     }
 
     [HttpGet("search")]
-    public IActionResult SearchProfiles([FromQuery] string query)
+    public async Task<IActionResult> SearchProfiles([FromQuery] string query)
     {
-        var results = _nodeRegistry.SearchProfiles(query);
+        // ✅ Ищем в локальной БД
+        var results = await _database.SearchProfilesAsync(query);
 
-        _logger.LogInformation("Profile search: '{Query}' → {Count} results",
+        _logger.LogInformation("Profile search: '{Query}' → {Count} results (local DB)",
             query, results.Count);
+
+        // ✅ FALLBACK: Если нашли мало результатов, спрашиваем соседей
+        if (results.Count < 5)
+        {
+            var aliveNodes = _nodeRegistry.GetAliveNodes()
+                .Where(n => n.NodeId != _nodeRegistry.LocalNodeId)
+                .Take(3) // Спрашиваем у 3 соседей
+                .ToList();
+
+            foreach (var node in aliveNodes)
+            {
+                try
+                {
+                    // Запрашиваем у соседа
+                    var client = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+                    var url = $"{node.PublicEndpoint}/client/search?query={Uri.EscapeDataString(query)}";
+
+                    var response = await client.GetAsync(url);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var json = await response.Content.ReadAsStringAsync();
+                        var remoteResults = System.Text.Json.JsonSerializer.Deserialize<List<ClientProfile>>(json,
+                            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                        if (remoteResults != null)
+                        {
+                            foreach (var profile in remoteResults)
+                            {
+                                // Сохраняем новые профили в БД
+                                if (!results.Any(r => r.NodeId == profile.NodeId))
+                                {
+                                    await _database.SaveProfileAsync(profile);
+                                    results.Add(profile);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to query neighbor {NodeId} for profiles", node.NodeId);
+                }
+            }
+
+            _logger.LogInformation("Profile search with fallback: '{Query}' → {Count} total results",
+                query, results.Count);
+        }
 
         return Ok(results);
     }

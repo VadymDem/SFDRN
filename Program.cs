@@ -1,4 +1,5 @@
-﻿using SFDRN.Server.Mesh;
+﻿using Microsoft.EntityFrameworkCore;
+using SFDRN.Server.Mesh;
 using SFDRN.Server.Models;
 using SFDRN.Server.Routing;
 using SFDRN.Server.Services;
@@ -19,6 +20,10 @@ builder.WebHost.UseUrls(
     Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? nodeConfig.PublicEndpoint
 );
 
+builder.Services.AddDbContextFactory<SFDRN.Server.Database.DatabaseContext>();
+builder.Services.AddSingleton<DatabaseService>();
+builder.Services.AddSingleton<ProfileSyncService>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<ProfileSyncService>());
 builder.Services.AddSingleton(nodeConfig);
 builder.Services.AddSingleton<NodeRegistry>();
 builder.Services.AddHostedService<NodeCleanupService>();
@@ -30,6 +35,15 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 
 var app = builder.Build();
+
+// Инициализация БД (применение миграций)
+using (var scope = app.Services.CreateScope())
+{
+    var contextFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<SFDRN.Server.Database.DatabaseContext>>();
+    await using var context = await contextFactory.CreateDbContextAsync();
+    await context.Database.MigrateAsync();
+    app.Logger.LogInformation("Database migrations applied");
+}
 
 // ✅ Enable WebSocket support
 app.UseWebSockets(new WebSocketOptions
