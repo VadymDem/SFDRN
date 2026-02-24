@@ -35,20 +35,16 @@ public class RoutingController : ControllerBase
             packet.PacketId, packet.Type, packet.SourceNode, packet.DestinationNode);
 
         // =========================
-        // 1️ Дедупликация для ВСЕХ пакетов (Data и Ack)
+        // 1️ Дедупликация
         // =========================
         var firstSeen = _packetStorage.TryMarkAsSeen(packet.PacketId);
         if (!firstSeen)
         {
             _logger.LogDebug("Duplicate {Type} packet {PacketId}", packet.Type, packet.PacketId);
-
-            // Только Data пакеты отправляют ACK при дубле
-            if (packet.Type == PacketType.Data &&
-                packet.DestinationNode == _nodeRegistry.LocalNodeId)
+            if (packet.Type == PacketType.Data)
             {
                 await SendAck(packet);
             }
-
             return Ok();
         }
 
@@ -63,14 +59,37 @@ public class RoutingController : ControllerBase
         }
 
         // =========================
-        // 3️ Если я получатель (Data packet)
+        // 3️✅ НОВОЕ: Проверяем ClientMap - может это наш клиент?
+        // =========================
+        var clientGateway = _nodeRegistry.GetClientGateway(packet.DestinationNode);
+
+        if (clientGateway == _nodeRegistry.LocalNodeId)
+        {
+            // Клиент подключен к этой ноде!
+            _packetStorage.StorePacket(packet);
+            await SendAck(packet);
+
+            await ClientController.NotifyClient(packet.DestinationNode, new
+            {
+                type = "new_message",
+                messageId = packet.PacketId,
+                from = packet.SourceNode,
+                timestamp = DateTime.UtcNow
+            });
+
+            _logger.LogInformation("Packet {PacketId} delivered to local client {ClientId}",
+                packet.PacketId, packet.DestinationNode);
+            return Ok();
+        }
+
+        // =========================
+        // 4️ Если я получатель-нода (не клиент)
         // =========================
         if (packet.DestinationNode == _nodeRegistry.LocalNodeId)
         {
             _packetStorage.StorePacket(packet);
             await SendAck(packet);
 
-            // ✅ Notify client via WebSocket if connected
             await ClientController.NotifyClient(packet.DestinationNode, new
             {
                 type = "new_message",
@@ -84,7 +103,7 @@ public class RoutingController : ControllerBase
         }
 
         // =========================
-        // 4️ Иначе маршрутизируем
+        // 5️ Иначе маршрутизируем дальше
         // =========================
         var result = await _routingEngine.RoutePacket(packet);
 
