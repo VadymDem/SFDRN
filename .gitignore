@@ -270,10 +270,6 @@ ServiceFabricBackup/
 *.db-shm
 *.db-wal
 
-# Migrations - ignore contents, but not the folder
-**/Migrations/*
-!**/Migrations/.gitkeep
-
 # Business Intelligence projects
 *.rdl.data
 *.bim.layout
