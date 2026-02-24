@@ -77,12 +77,14 @@ public class ClientController : ControllerBase
             Ttl = 10
         };
 
-        // 1. Проверяем, не наш ли это клиент (WebSocket)
+        // 1. Проверяем WebSocket соединение
         if (_clientConnections.ContainsKey(message.ToNodeId))
         {
             _packetStorage.StorePacket(packet);
             await NotifyClient(message.ToNodeId, new { type = "new_message", from = packet.SourceNode });
-            return Ok(new { success = true });
+            _logger.LogInformation("Message {PacketId} delivered via WebSocket to {ToNode}",
+                packet.PacketId, message.ToNodeId);
+            return Ok(new { success = true, method = "websocket" });
         }
 
         // 2. Ищем, на какой ноде сидит клиент
@@ -90,21 +92,39 @@ public class ClientController : ControllerBase
 
         if (gatewayId != null)
         {
+            // ✅ КРИТИЧЕСКИ ВАЖНО: Если клиент на ЭТОЙ ноде — доставить локально!
+            if (gatewayId == _nodeRegistry.LocalNodeId)
+            {
+                _packetStorage.StorePacket(packet);
+                _logger.LogInformation("Message {PacketId} stored locally for {ToNode}",
+                    packet.PacketId, message.ToNodeId);
+                return Ok(new { success = true, method = "local" });
+            }
+
             // Клиент на другой ноде — шлем туда через меш
             var result = await _routingEngine.RouteToClient(gatewayId, packet);
-            return Ok(new { success = result });
+            _logger.LogInformation("Message {PacketId} routed to gateway {Gateway}: {Result}",
+                packet.PacketId, gatewayId, result);
+            return Ok(new { success = result, method = "mesh", gateway = gatewayId });
         }
 
-        // 3. Если вообще не знаем клиента — Flooding (рассылка всем живым нодам)
+        // 3. Если вообще не знаем клиента — Flooding
         _logger.LogWarning("Unknown client {To}. Flooding to all neighbors.", message.ToNodeId);
-        var aliveNodes = _nodeRegistry.GetAliveNodes().Where(n => n.NodeId != _nodeRegistry.LocalNodeId);
+        var aliveNodes = _nodeRegistry.GetAliveNodes().Where(n => n.NodeId != _nodeRegistry.LocalNodeId).ToList();
 
-        foreach (var node in aliveNodes)
+        if (aliveNodes.Any())
         {
-            _ = _routingEngine.TryForward(node.PublicEndpoint, packet); // Пожар и забыл
+            foreach (var node in aliveNodes)
+            {
+                _ = _routingEngine.TryForward(node.PublicEndpoint, packet);
+            }
+            return Ok(new { success = true, status = "broadcasted", neighbors = aliveNodes.Count });
         }
 
-        return Ok(new { success = true, status = "broadcasted" });
+        // 4. Нет соседей — сохраняем локально (может клиент появится позже)
+        _packetStorage.StorePacket(packet);
+        _logger.LogWarning("No neighbors available. Message {PacketId} stored locally.", packet.PacketId);
+        return Ok(new { success = true, status = "stored_offline" });
     }
 
     // =========================================================

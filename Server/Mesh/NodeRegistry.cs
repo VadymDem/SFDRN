@@ -47,6 +47,8 @@ public class NodeRegistry
     public void UpdateClientLocation(string clientId, string gatewayNodeId)
     {
         _clientToNodeMap[clientId] = gatewayNodeId;
+        _logger?.LogInformation("Client {ClientId} mapped to gateway {GatewayId}, total clients: {Total}",
+            clientId, gatewayNodeId, _clientToNodeMap.Count);
     }
 
     /// <summary>
@@ -54,15 +56,28 @@ public class NodeRegistry
     /// </summary>
     public void SyncClientMap(Dictionary<string, string> remoteClientMap)
     {
+        var added = 0;
         foreach (var (clientId, gatewayId) in remoteClientMap)
         {
-            // Обновляем только если это не наш локальный клиент (наша инфа приоритетнее)
-            // И если мы вообще знаем такую ноду-шлюз
-            if (gatewayId != _localConfig.NodeId && _nodes.ContainsKey(gatewayId))
+            // ✅ ИСПРАВЛЕНО: Принимаем всех клиентов, кроме случая когда
+            // мы уже знаем этого клиента и он на нашей ноде (наша инфа точнее)
+            if (_clientToNodeMap.TryGetValue(clientId, out var existingGateway))
             {
-                _clientToNodeMap[clientId] = gatewayId;
+                // Уже знаем этого клиента
+                if (existingGateway == _localConfig.NodeId)
+                {
+                    // Клиент на нашей ноде - наша информация приоритетнее
+                    continue;
+                }
             }
+
+            // Добавляем/обновляем запись
+            _clientToNodeMap[clientId] = gatewayId;
+            added++;
         }
+
+        _logger?.LogInformation("SyncClientMap: added/updated {Count} clients, total: {Total}",
+            added, _clientToNodeMap.Count);
     }
 
     public string? GetClientGateway(string clientId)
@@ -71,7 +86,12 @@ public class NodeRegistry
         return nodeId;
     }
 
-    public Dictionary<string, string> GetClientMap() => _clientToNodeMap.ToDictionary(k => k.Key, v => v.Value);
+    public Dictionary<string, string> GetClientMap()
+    {
+        var map = _clientToNodeMap.ToDictionary(k => k.Key, v => v.Value);
+        _logger?.LogDebug("GetClientMap: returning {Count} clients", map.Count);
+        return map;
+    }
 
     // --- ЛОГИКА НОД ---
 
