@@ -20,7 +20,10 @@ builder.WebHost.UseUrls(
     Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? nodeConfig.PublicEndpoint
 );
 
-builder.Services.AddDbContextFactory<SFDRN.Server.Database.DatabaseContext>();
+var dataDirectory = builder.Configuration["Database:Path"] ?? "/app/data";
+Directory.CreateDirectory(dataDirectory);
+var dbPath = Path.Combine(dataDirectory, "sfdrn.db");
+builder.Services.AddDbContextFactory<SFDRN.Server.Database.DatabaseContext>(options => options.UseSqlite($"Data Source={dbPath}"));
 builder.Services.AddSingleton<DatabaseService>();
 builder.Services.AddSingleton<ProfileSyncService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ProfileSyncService>());
