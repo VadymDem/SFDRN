@@ -280,7 +280,9 @@ public class ClientController : ControllerBase
     }
 
     [HttpGet("search")]
-    public async Task<IActionResult> SearchProfiles([FromQuery] string query)
+    public async Task<IActionResult> SearchProfiles(
+    [FromQuery] string query,
+    [FromQuery] bool isFallback = false)  // ← Новый параметр
     {
         // ✅ Ищем в локальной БД
         var results = await _database.SearchProfilesAsync(query);
@@ -288,21 +290,22 @@ public class ClientController : ControllerBase
         _logger.LogInformation("Profile search: '{Query}' → {Count} results (local DB)",
             query, results.Count);
 
-        // ✅ FALLBACK: Если нашли мало результатов, спрашиваем соседей
-        if (results.Count < 5)
+        // ✅ FALLBACK: Только если это НЕ fallback запрос (чтобы избежать loop)
+        // И нашли мало результатов
+        if (!isFallback && results.Count < 5)
         {
             var aliveNodes = _nodeRegistry.GetAliveNodes()
                 .Where(n => n.NodeId != _nodeRegistry.LocalNodeId)
-                .Take(3) // Спрашиваем у 3 соседей
+                .Take(3)
                 .ToList();
 
             foreach (var node in aliveNodes)
             {
                 try
                 {
-                    // Запрашиваем у соседа
-                    var client = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
-                    var url = $"{node.PublicEndpoint}/client/search?query={Uri.EscapeDataString(query)}";
+                    var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+                    // ← Добавляем &isFallback=true чтобы остановить рекурсию
+                    var url = $"{node.PublicEndpoint}/client/search?query={Uri.EscapeDataString(query)}&isFallback=true";
 
                     var response = await client.GetAsync(url);
                     if (response.IsSuccessStatusCode)
@@ -315,7 +318,6 @@ public class ClientController : ControllerBase
                         {
                             foreach (var profile in remoteResults)
                             {
-                                // Сохраняем новые профили в БД
                                 if (!results.Any(r => r.NodeId == profile.NodeId))
                                 {
                                     await _database.SaveProfileAsync(profile);
@@ -327,7 +329,8 @@ public class ClientController : ControllerBase
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to query neighbor {NodeId} for profiles", node.NodeId);
+                    _logger.LogWarning("Failed to query neighbor {NodeId} for profiles: {Error}",
+                        node.NodeId, ex.Message);
                 }
             }
 
