@@ -168,13 +168,14 @@ public class GossipService : BackgroundService
 
         // ✅ ИЗМЕНЕНО: получаем дайджесты из БД вместо полных профилей
         var profileDigests = await _database.GetProfileDigestsAsync();
+        _logger.LogInformation("Sending gossip with {Count} profile digests", profileDigests.Count);
 
         var message = new GossipMessage
         {
             SenderNodeId = _nodeRegistry.LocalNodeId,
             KnownNodes = nodesToShare,
             ClientMap = _nodeRegistry.GetClientMap(),
-            ProfileDigests = profileDigests  // ✅ Дайджесты вместо Profiles
+            ProfileDigests = profileDigests
         };
 
         try

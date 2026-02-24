@@ -128,7 +128,11 @@ public class DatabaseService
         {
             await using var context = await _contextFactory.CreateDbContextAsync();
 
-            return await context.Profiles
+            // ✅ DEBUG: проверяем что БД видит
+            var count = await context.Profiles.CountAsync();
+            _logger.LogInformation("GetProfileDigestsAsync: Found {Count} profiles in DB", count);
+
+            var digests = await context.Profiles
                 .Select(p => new ProfileDigest
                 {
                     NodeId = p.NodeId,
@@ -136,8 +140,15 @@ public class DatabaseService
                     Hash = p.Hash
                 })
                 .ToListAsync();
+
+            _logger.LogInformation("GetProfileDigestsAsync: Returning {Count} digests", digests.Count);
+            return digests;
         }
-        catch { return new(); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "GetProfileDigestsAsync FAILED!");
+            return new();
+        }
     }
 
     public async Task<List<string>> GetMissingProfileIdsAsync(List<ProfileDigest> remoteDigests)
