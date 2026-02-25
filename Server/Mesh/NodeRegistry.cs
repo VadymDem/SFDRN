@@ -83,6 +83,16 @@ public class NodeRegistry
     public string? GetClientGateway(string clientId)
     {
         _clientToNodeMap.TryGetValue(clientId, out var nodeId);
+
+        _logger?.LogInformation("GetClientGateway({ClientId}) = {Gateway}", clientId, nodeId ?? "NULL");
+
+        // Debug: покажем всю карту
+        _logger?.LogInformation("ClientMap contains {Count} clients:", _clientToNodeMap.Count);
+        foreach (var (c, g) in _clientToNodeMap.Take(10))
+        {
+            _logger?.LogInformation("  {Client} -> {Gateway}", c[..Math.Min(20, c.Length)], g);
+        }
+
         return nodeId;
     }
 

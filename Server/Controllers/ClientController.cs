@@ -68,6 +68,12 @@ public class ClientController : ControllerBase
     [HttpPost("send")]
     public async Task<IActionResult> SendMessage([FromBody] ClientMessage message)
     {
+        _logger.LogInformation("═══════════════════════════════════");
+        _logger.LogInformation("[Send] MessageId: {MessageId}", message.MessageId);
+        _logger.LogInformation("[Send] From: {From}", message.FromNodeId);
+        _logger.LogInformation("[Send] To: {To}", message.ToNodeId);
+        _logger.LogInformation("[Send] LocalNodeId: {Local}", _nodeRegistry.LocalNodeId);
+
         var packet = new PacketEnvelope
         {
             PacketId = message.MessageId ?? Guid.NewGuid().ToString(),
@@ -80,51 +86,52 @@ public class ClientController : ControllerBase
         // 1. Проверяем WebSocket соединение
         if (_clientConnections.ContainsKey(message.ToNodeId))
         {
+            _logger.LogInformation("[Send] Found WebSocket connection for {To}", message.ToNodeId);
             _packetStorage.StorePacket(packet);
             await NotifyClient(message.ToNodeId, new { type = "new_message", from = packet.SourceNode });
-            _logger.LogInformation("Message {PacketId} delivered via WebSocket to {ToNode}",
-                packet.PacketId, message.ToNodeId);
             return Ok(new { success = true, method = "websocket" });
         }
 
         // 2. Ищем, на какой ноде сидит клиент
         var gatewayId = _nodeRegistry.GetClientGateway(message.ToNodeId);
 
+        _logger.LogInformation("[Send] GetClientGateway({To}) = {Gateway}", message.ToNodeId, gatewayId ?? "NULL");
+
         if (gatewayId != null)
         {
-            // ✅ КРИТИЧЕСКИ ВАЖНО: Если клиент на ЭТОЙ ноде — доставить локально!
             if (gatewayId == _nodeRegistry.LocalNodeId)
             {
+                _logger.LogInformation("[Send] ⚠️ WRONG: Gateway is LOCAL, storing locally");
                 _packetStorage.StorePacket(packet);
-                _logger.LogInformation("Message {PacketId} stored locally for {ToNode}",
-                    packet.PacketId, message.ToNodeId);
                 return Ok(new { success = true, method = "local" });
             }
 
-            // Клиент на другой ноде — шлем туда через меш
+            _logger.LogInformation("[Send] ✅ Routing to gateway {Gateway}", gatewayId);
             var result = await _routingEngine.RouteToClient(gatewayId, packet);
-            _logger.LogInformation("Message {PacketId} routed to gateway {Gateway}: {Result}",
-                packet.PacketId, gatewayId, result);
             return Ok(new { success = result, method = "mesh", gateway = gatewayId });
         }
 
-        // 3. Если вообще не знаем клиента — Flooding
-        _logger.LogWarning("Unknown client {To}. Flooding to all neighbors.", message.ToNodeId);
-        var aliveNodes = _nodeRegistry.GetAliveNodes().Where(n => n.NodeId != _nodeRegistry.LocalNodeId).ToList();
+        // 3. Не знаем клиента
+        _logger.LogWarning("[Send] ❓ Unknown client, flooding");
+
+        var aliveNodes = _nodeRegistry.GetAliveNodes()
+            .Where(n => n.NodeId != _nodeRegistry.LocalNodeId)
+            .ToList();
+
+        _logger.LogInformation("[Send] Alive neighbors: {Count}", aliveNodes.Count);
 
         if (aliveNodes.Any())
         {
             foreach (var node in aliveNodes)
             {
+                _logger.LogInformation("[Send] Flooding to {NodeId}: {Endpoint}", node.NodeId, node.PublicEndpoint);
                 _ = _routingEngine.TryForward(node.PublicEndpoint, packet);
             }
-            return Ok(new { success = true, status = "broadcasted", neighbors = aliveNodes.Count });
+            return Ok(new { success = true, method = "flood", neighbors = aliveNodes.Count });
         }
 
-        // 4. Нет соседей — сохраняем локально (может клиент появится позже)
         _packetStorage.StorePacket(packet);
-        _logger.LogWarning("No neighbors available. Message {PacketId} stored locally.", packet.PacketId);
-        return Ok(new { success = true, status = "stored_offline" });
+        return Ok(new { success = true, method = "stored_offline" });
     }
 
     // =========================================================

@@ -174,9 +174,18 @@ public class GossipService : BackgroundService
         {
             SenderNodeId = _nodeRegistry.LocalNodeId,
             KnownNodes = nodesToShare,
-            ClientMap = _nodeRegistry.GetClientMap(),
+            ClientMap = _nodeRegistry.GetClientMap(),  // ← Добавь лог
             ProfileDigests = profileDigests
         };
+
+        _logger.LogInformation("═══════════════════════════════════");
+        _logger.LogInformation("[Gossip] Sending to {NodeId}", target.NodeId);
+        _logger.LogInformation("[Gossip] ClientMap count: {Count}", message.ClientMap.Count);
+        foreach (var (c, g) in message.ClientMap.Take(5))
+        {
+            _logger.LogInformation("[Gossip]   {Client} -> {Gateway}", c[..Math.Min(20, c.Length)], g);
+        }
+        _logger.LogInformation("═══════════════════════════════════");
 
         try
         {
