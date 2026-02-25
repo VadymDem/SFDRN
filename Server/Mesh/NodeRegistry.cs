@@ -59,19 +59,7 @@ public class NodeRegistry
         var added = 0;
         foreach (var (clientId, gatewayId) in remoteClientMap)
         {
-            // ✅ ИСПРАВЛЕНО: Принимаем всех клиентов, кроме случая когда
-            // мы уже знаем этого клиента и он на нашей ноде (наша инфа точнее)
-            if (_clientToNodeMap.TryGetValue(clientId, out var existingGateway))
-            {
-                // Уже знаем этого клиента
-                if (existingGateway == _localConfig.NodeId)
-                {
-                    // Клиент на нашей ноде - наша информация приоритетнее
-                    continue;
-                }
-            }
-
-            // Добавляем/обновляем запись
+            // ✅ ПРОСТОЕ РЕШЕНИЕ: Всегда обновляем
             _clientToNodeMap[clientId] = gatewayId;
             added++;
         }
@@ -176,6 +164,12 @@ public class NodeRegistry
     public List<NodeInfo> GetAllNodes() { lock (_lockObject) return _nodes.Values.ToList(); }
 
     public List<NodeInfo> GetAliveNodes() { lock (_lockObject) return _nodes.Values.Where(n => n.Status == NodeStatus.Alive).ToList(); }
+
+    public void RemoveClientLocation(string clientId)
+    {
+        _clientToNodeMap.TryRemove(clientId, out _);
+        _logger?.LogInformation("Client {ClientId} removed from map", clientId);
+    }
 
     public void MarkNodeDead(string nodeId)
     {

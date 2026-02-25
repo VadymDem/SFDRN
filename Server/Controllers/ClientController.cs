@@ -133,6 +133,7 @@ public class ClientController : ControllerBase
         _packetStorage.StorePacket(packet);
         return Ok(new { success = true, method = "stored_offline" });
     }
+    
 
     // =========================================================
     // Get Messages (HTTP Polling)
@@ -245,6 +246,9 @@ public class ClientController : ControllerBase
             {
                 _clientConnections.Remove(nodeId);
             }
+
+            // ✅ Удаляем из ClientMap при отключении
+            _nodeRegistry.RemoveClientLocation(nodeId);
 
             _logger.LogInformation("WebSocket disconnected: {NodeId}", nodeId);
         }
