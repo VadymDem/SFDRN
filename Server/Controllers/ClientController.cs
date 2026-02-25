@@ -254,24 +254,81 @@ public class ClientController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Получить профиль клиента по NodeId (ищет по всей сети)
+    /// </summary>
     [HttpGet("profile/{nodeId}")]
-    public async Task<IActionResult> GetClientProfile(string nodeId)
+    public async Task<IActionResult> GetProfile(string nodeId)
     {
-        // Сначала проверяем локально
+        _logger.LogInformation("[GetProfile] Looking for: {NodeId}", nodeId);
+
+        // 1. Ищем локально
         var profile = await _database.GetProfileAsync(nodeId);
         if (profile != null)
         {
+            _logger.LogInformation("[GetProfile] Found locally: {DisplayName}", profile.DisplayName);
             return Ok(new ClientProfile
             {
                 NodeId = profile.NodeId,
                 DisplayName = profile.DisplayName,
                 GlobalNickname = profile.GlobalNickname,
-                Status = profile.Status
+                Status = profile.Status,
+                LastUpdated = profile.LastUpdated
             });
         }
 
-        // Если не нашли - возвращаем 404
-        return NotFound(new { error = "Profile not found", nodeId });
+        // 2. Ищем gateway клиента
+        var gatewayId = _nodeRegistry.GetClientGateway(nodeId);
+        if (string.IsNullOrEmpty(gatewayId))
+        {
+            _logger.LogWarning("[GetProfile] Client not found in ClientMap: {NodeId}", nodeId);
+            return NotFound(new { error = "Client not found", nodeId });
+        }
+
+        // 3. Если клиент на этой ноде но профиля нет
+        if (gatewayId == _nodeRegistry.LocalNodeId)
+        {
+            _logger.LogWarning("[GetProfile] Client is local but no profile: {NodeId}", nodeId);
+            return NotFound(new { error = "Profile not found", nodeId });
+        }
+
+        // 4. Запрашиваем у удалённой ноды
+        var gateway = _nodeRegistry.GetNode(gatewayId);
+        if (gateway == null)
+        {
+            _logger.LogWarning("[GetProfile] Gateway not found: {GatewayId}", gatewayId);
+            return NotFound(new { error = "Gateway not found", gatewayId });
+        }
+
+        try
+        {
+            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var url = $"{gateway.PublicEndpoint}/client/profile/{nodeId}";
+
+            _logger.LogInformation("[GetProfile] Forwarding to: {Url}", url);
+
+            var response = await client.GetAsync(url);
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync();
+                var remoteProfile = JsonSerializer.Deserialize<ClientProfile>(json,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                if (remoteProfile != null)
+                {
+                    _logger.LogInformation("[GetProfile] Found on remote: {DisplayName}", remoteProfile.DisplayName);
+                    return Ok(remoteProfile);
+                }
+            }
+
+            _logger.LogWarning("[GetProfile] Remote lookup failed: {Status}", response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[GetProfile] Remote request failed");
+        }
+
+        return NotFound(new { error = "Profile not found anywhere", nodeId });
     }
 
     // =========================================================
