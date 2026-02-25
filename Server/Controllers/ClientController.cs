@@ -254,6 +254,26 @@ public class ClientController : ControllerBase
         }
     }
 
+    [HttpGet("profile/{nodeId}")]
+    public async Task<IActionResult> GetClientProfile(string nodeId)
+    {
+        // Сначала проверяем локально
+        var profile = await _database.GetProfileAsync(nodeId);
+        if (profile != null)
+        {
+            return Ok(new ClientProfile
+            {
+                NodeId = profile.NodeId,
+                DisplayName = profile.DisplayName,
+                GlobalNickname = profile.GlobalNickname,
+                Status = profile.Status
+            });
+        }
+
+        // Если не нашли - возвращаем 404
+        return NotFound(new { error = "Profile not found", nodeId });
+    }
+
     // =========================================================
     // Internal: Notify client via WebSocket
     // =========================================================

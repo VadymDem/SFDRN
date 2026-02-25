@@ -84,6 +84,15 @@ public class NodeRegistry
         return nodeId;
     }
 
+    /// <summary>
+    /// Получить endpoint ноды по её ID
+    /// </summary>
+    public string? GetNodeEndpoint(string nodeId)
+    {
+        var node = GetNode(nodeId);
+        return node?.PublicEndpoint;
+    }
+
     public Dictionary<string, string> GetClientMap()
     {
         var map = _clientToNodeMap.ToDictionary(k => k.Key, v => v.Value);
