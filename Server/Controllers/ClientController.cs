@@ -448,11 +448,154 @@ public class ClientController : ControllerBase
 
         return Ok(results);
     }
+
+    // === 1.1 MESSAGE RECEIPT CHAIN ===
+
+    /// <summary>
+    /// Получить статус сообщения
+    /// </summary>
+    [HttpGet("message/{messageId}/status")]
+    public async Task<IActionResult> GetMessageStatus(string messageId)
+    {
+        var status = await _database.GetMessageStatusAsync(messageId);
+        var history = await _database.GetMessageStatusHistoryAsync(messageId);
+
+        return Ok(new
+        {
+            messageId,
+            status = status.ToString(),
+            statusValue = (int)status,
+            history = history.Select(h => new
+            {
+                status = h.Status.ToString(),
+                timestamp = h.Timestamp,
+                nodeId = h.NodeId,
+                details = h.Details
+            })
+        });
+    }
+
+    /// <summary>
+    /// Пометить сообщение как доставленное (вызывается клиентом при получении)
+    /// </summary>
+    [HttpPost("message/{messageId}/delivered")]
+    public async Task<IActionResult> MarkDelivered(string messageId, [FromBody] DeliveryAckRequest? request)
+    {
+        var success = await _database.MarkMessageDeliveredAsync(messageId, request?.NodeId);
+
+        if (success)
+        {
+            _logger.LogInformation("[Delivery] Message {MessageId} marked as delivered", messageId);
+
+            // Уведомляем отправителя о доставке
+            // (можно реализовать через NotifyClient если отправитель онлайн)
+        }
+
+        return Ok(new { success, messageId, status = "Delivered" });
+    }
+
+    /// <summary>
+    /// Пометить сообщение как прочитанное
+    /// </summary>
+    [HttpPost("message/{messageId}/read")]
+    public async Task<IActionResult> MarkRead(string messageId, [FromBody] ReadAckRequest? request)
+    {
+        var success = await _database.MarkMessageReadAsync(messageId, request?.NodeId);
+
+        if (success)
+        {
+            _logger.LogInformation("[Read] Message {MessageId} marked as read", messageId);
+
+            // Уведомляем отправителя о прочтении
+            // (можно реализовать через NotifyClient если отправитель онлайн)
+        }
+
+        return Ok(new { success, messageId, status = "Read" });
+    }
+
+    /// <summary>
+    /// Batch mark messages as read
+    /// </summary>
+    [HttpPost("messages/read")]
+    public async Task<IActionResult> MarkMultipleRead([FromBody] BatchReadRequest request)
+    {
+        var results = new List<object>();
+
+        foreach (var messageId in request.MessageIds)
+        {
+            var success = await _database.MarkMessageReadAsync(messageId);
+            results.Add(new { messageId, success });
+        }
+
+        return Ok(new { processed = results.Count, results });
+    }
+
+    // === 1.2 TTL & STATS ===
+
+    /// <summary>
+    /// Получить статистику сообщений на ноде
+    /// </summary>
+    [HttpGet("messages/stats")]
+    public async Task<IActionResult> GetMessageStats()
+    {
+        var stats = await _database.GetMessageStatsAsync();
+        return Ok(stats);
+    }
+
+    /// <summary>
+    /// Принудительно запустить очистку просроченных сообщений (admin)
+    /// </summary>
+    [HttpPost("messages/cleanup")]
+    public async Task<IActionResult> CleanupExpiredMessages()
+    {
+        var count = await _database.CleanupExpiredMessagesAsync();
+        return Ok(new { cleaned = count, timestamp = DateTime.UtcNow });
+    }
+
+    /// <summary>
+    /// Получить pending сообщения с информацией о TTL
+    /// </summary>
+    [HttpGet("messages/{nodeId}/pending")]
+    public async Task<IActionResult> GetPendingMessages(string nodeId)
+    {
+        var messages = await _database.GetUndeliveredMessagesAsync(nodeId);
+
+        return Ok(new
+        {
+            nodeId,
+            count = messages.Count,
+            messages = messages.Select(m => new
+            {
+                messageId = m.MessageId,
+                from = m.FromNodeId,
+                status = m.Status.ToString(),
+                timestamp = m.Timestamp,
+                storedAt = m.StoredAt,
+                ttlSeconds = m.TtlSeconds,
+                expiresAt = m.StoredAt.AddSeconds(m.TtlSeconds),
+                contentType = m.ContentType.ToString()
+            })
+        });
+    }
 }
 
-// =========================================================
-// Models
-// =========================================================
+// === MODELS ===
+
+public class DeliveryAckRequest
+{
+    public string? NodeId { get; set; }
+}
+
+public class ReadAckRequest
+{
+    public string? NodeId { get; set; }
+}
+
+public class BatchReadRequest
+{
+    public List<string> MessageIds { get; set; } = new();
+}
+
 public class ClientRegistration
 {
     public string? DeviceId { get; set; }
