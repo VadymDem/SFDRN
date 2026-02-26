@@ -1,9 +1,11 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using SFDRN.Server.Database.Models;
 using SFDRN.Server.Mesh;
 using SFDRN.Server.Models;
 using SFDRN.Server.Routing;
 using SFDRN.Server.Services;
 using SFDRN.Server.Storage;
+using System.Net.Mime;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -74,9 +76,32 @@ public class ClientController : ControllerBase
         _logger.LogInformation("[Send] To: {To}", message.ToNodeId);
         _logger.LogInformation("[Send] LocalNodeId: {Local}", _nodeRegistry.LocalNodeId);
 
+        var messageId = message.MessageId ?? Guid.NewGuid().ToString();
+        var contentType = (MessageType)(message.ContentType ?? 0);
+
+        // ═════════════════════════════════════════════════════════
+        // ✅ PHASE 1.1: СОХРАНЯЕМ В БД СО СТАТУСОМ ReceivedByNode
+        // ═════════════════════════════════════════════════════════
+        var storedMessage = await _database.SaveMessageAsync(
+            messageId,
+            message.FromNodeId,
+            message.ToNodeId,
+            message.Payload,  // ← Это EncryptedPayload
+            contentType);
+
+        if (storedMessage == null)
+        {
+            _logger.LogError("[Send] ❌ Failed to save message to DB");
+            return StatusCode(500, new { success = false, error = "Failed to store message" });
+        }
+
+        // Обновляем статус на Stored
+        await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Stored);
+        _logger.LogInformation("[Send] ✅ Saved to DB: {MessageId}", messageId);
+
         var packet = new PacketEnvelope
         {
-            PacketId = message.MessageId ?? Guid.NewGuid().ToString(),
+            PacketId = messageId,
             SourceNode = message.FromNodeId,
             DestinationNode = message.ToNodeId,
             EncryptedPayload = message.Payload,
@@ -88,8 +113,18 @@ public class ClientController : ControllerBase
         {
             _logger.LogInformation("[Send] Found WebSocket connection for {To}", message.ToNodeId);
             _packetStorage.StorePacket(packet);
-            await NotifyClient(message.ToNodeId, new { type = "new_message", from = packet.SourceNode });
-            return Ok(new { success = true, method = "websocket" });
+
+            // ✅ Обновляем статус на Forwarded
+            await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Forwarded);
+
+            await NotifyClient(message.ToNodeId, new
+            {
+                type = "new_message",
+                messageId,
+                from = packet.SourceNode
+            });
+
+            return Ok(new { success = true, method = "websocket", messageId });
         }
 
         // 2. Ищем, на какой ноде сидит клиент
@@ -101,17 +136,24 @@ public class ClientController : ControllerBase
         {
             if (gatewayId == _nodeRegistry.LocalNodeId)
             {
-                _logger.LogInformation("[Send] ⚠️ WRONG: Gateway is LOCAL, storing locally");
+                _logger.LogInformation("[Send] ⚠️ Gateway is LOCAL, storing locally");
                 _packetStorage.StorePacket(packet);
-                return Ok(new { success = true, method = "local" });
+                return Ok(new { success = true, method = "local", messageId });
             }
 
             _logger.LogInformation("[Send] ✅ Routing to gateway {Gateway}", gatewayId);
             var result = await _routingEngine.RouteToClient(gatewayId, packet);
-            return Ok(new { success = result, method = "mesh", gateway = gatewayId });
+
+            if (result)
+            {
+                // ✅ Обновляем статус на Forwarded
+                await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Forwarded);
+            }
+
+            return Ok(new { success = result, method = "mesh", gateway = gatewayId, messageId });
         }
 
-        // 3. Не знаем клиента
+        // 3. Не знаем клиента - flooding
         _logger.LogWarning("[Send] ❓ Unknown client, flooding");
 
         var aliveNodes = _nodeRegistry.GetAliveNodes()
@@ -127,13 +169,18 @@ public class ClientController : ControllerBase
                 _logger.LogInformation("[Send] Flooding to {NodeId}: {Endpoint}", node.NodeId, node.PublicEndpoint);
                 _ = _routingEngine.TryForward(node.PublicEndpoint, packet);
             }
-            return Ok(new { success = true, method = "flood", neighbors = aliveNodes.Count });
+
+            // ✅ Обновляем статус на Forwarded
+            await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Forwarded);
+
+            return Ok(new { success = true, method = "flood", neighbors = aliveNodes.Count, messageId });
         }
 
+        // 4. Нет соседей - сохраняем offline
         _packetStorage.StorePacket(packet);
-        return Ok(new { success = true, method = "stored_offline" });
+        return Ok(new { success = true, method = "stored_offline", messageId });
     }
-    
+
 
     // =========================================================
     // Get Messages (HTTP Polling)
@@ -616,6 +663,7 @@ public class ClientMessage
     public string ToNodeId { get; set; } = string.Empty;
     public byte[] Payload { get; set; } = Array.Empty<byte>();
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+    public int? ContentType { get; set; }  
 }
 
 public class ClientProfileRequest
