@@ -196,7 +196,8 @@ public class ClientController : ControllerBase
             FromNodeId = p.SourceNode,
             ToNodeId = p.DestinationNode,
             Payload = p.EncryptedPayload,
-            Timestamp = p.CreatedAt
+            Timestamp = p.CreatedAt,
+            ContentType = 0  // ← Default: Text
         }).ToList();
 
         _logger.LogInformation("Retrieved {Count} messages for {NodeId}",

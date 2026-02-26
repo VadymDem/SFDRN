@@ -10,19 +10,12 @@ namespace SFDRN.Server.Database.Models;
 /// </summary>
 public enum MessageStatus
 {
-    /// <summary>Сообщение создано отправителем</summary>
-    Created = 0,
-    /// <summary>Принято нодой отправителя</summary>
+    Created = 0,      // = Sending
     ReceivedByNode = 1,
-    /// <summary>Сохранено в хранилище</summary>
     Stored = 2,
-    /// <summary>Передано следующей ноде</summary>
     Forwarded = 3,
-    /// <summary>Доставлено получателю</summary>
-    Delivered = 4,
-    /// <summary>Прочитано получателем</summary>
-    Read = 5,
-    /// <summary>Ошибка доставки</summary>
+    Delivered = 4,    // = Delivered
+    Read = 5,         // = Read
     Failed = 99
 }
 
