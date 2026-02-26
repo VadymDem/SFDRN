@@ -1,4 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using SFDRN.Server.Background;
 using SFDRN.Server.Mesh;
 using SFDRN.Server.Models;
 using SFDRN.Server.Routing;
@@ -36,6 +37,7 @@ builder.Services.AddHttpClient();
 builder.Services.AddHostedService<GossipService>();
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddTTLCleanup();
 
 var app = builder.Build();
 
