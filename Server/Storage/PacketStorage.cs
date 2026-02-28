@@ -15,6 +15,9 @@ public class PacketStorage
     // ✅ Хранилище сообщений по получателям (для клиентов)
     private readonly ConcurrentDictionary<string, ConcurrentQueue<PacketEnvelope>> _nodeMessages = new();
 
+    // ✅ Lock для атомарных операций удаления
+    private readonly object _removeLock = new();
+
     public PacketStorage(ILogger<PacketStorage> logger)
     {
         _logger = logger;
@@ -61,6 +64,50 @@ public class PacketStorage
 
         _logger.LogInformation("Retrieved {Count} packets for {NodeId}", packets.Count, nodeId);
         return packets;
+    }
+
+    // ✅ Удалить пакет по ID
+    public bool RemovePacket(string packetId)
+    {
+        lock (_removeLock)
+        {
+            // Удаляем из основной очереди (пересоздаём очередь без нужного элемента)
+            var remaining = new List<PacketEnvelope>();
+            while (_packets.TryDequeue(out var packet))
+            {
+                if (packet.PacketId != packetId)
+                {
+                    remaining.Add(packet);
+                }
+            }
+
+            foreach (var p in remaining)
+            {
+                _packets.Enqueue(p);
+            }
+
+            // Удаляем из очередей получателей
+            foreach (var kvp in _nodeMessages)
+            {
+                var nodeQueue = kvp.Value;
+                var nodeRemaining = new List<PacketEnvelope>();
+                while (nodeQueue.TryDequeue(out var packet))
+                {
+                    if (packet.PacketId != packetId)
+                    {
+                        nodeRemaining.Add(packet);
+                    }
+                }
+
+                foreach (var p in nodeRemaining)
+                {
+                    nodeQueue.Enqueue(p);
+                }
+            }
+
+            _logger.LogDebug("RemovePacket: {PacketId}", packetId);
+            return true;
+        }
     }
 
     // ✅ Получить количество непрочитанных сообщений

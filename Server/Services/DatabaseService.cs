@@ -462,6 +462,19 @@ public class DatabaseService
         }
     }
 
+    /// <summary>
+    /// Получить сообщение по ID
+    /// </summary>
+    public async Task<StoredMessage?> GetMessageAsync(string messageId)
+    {
+        try
+        {
+            await using var context = await _contextFactory.CreateDbContextAsync();
+            return await context.Messages.FindAsync(messageId);
+        }
+        catch { return null; }
+    }
+
     // =========================================================
     // MESSAGES - Deduplication (PHASE 1.3)
     // =========================================================

@@ -5,7 +5,6 @@ using SFDRN.Server.Models;
 using SFDRN.Server.Routing;
 using SFDRN.Server.Services;
 using SFDRN.Server.Storage;
-using System.Net.Mime;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -22,6 +21,7 @@ public class ClientController : ControllerBase
     private readonly ILogger<ClientController> _logger;
     private readonly DatabaseService _database;
     private readonly ProfileSyncService _profileSync;
+    private readonly IHttpClientFactory _httpClientFactory;  // ✅ Добавлено
 
     // ✅ Активные WebSocket соединения клиентов
     private static readonly Dictionary<string, WebSocket> _clientConnections = new();
@@ -32,15 +32,17 @@ public class ClientController : ControllerBase
         PacketStorage packetStorage,
         NodeRegistry nodeRegistry,
         ILogger<ClientController> logger,
-        DatabaseService database,           // ✅ Добавлено
-        ProfileSyncService profileSync)     // ✅ Добавлено
+        DatabaseService database,
+        ProfileSyncService profileSync,
+        IHttpClientFactory httpClientFactory)  // ✅ Добавлено
     {
         _routingEngine = routingEngine;
         _packetStorage = packetStorage;
         _nodeRegistry = nodeRegistry;
         _logger = logger;
-        _database = database;               // ✅ Добавлено
-        _profileSync = profileSync;         // ✅ Добавлено
+        _database = database;
+        _profileSync = profileSync;
+        _httpClientFactory = httpClientFactory;  // ✅ Добавлено
     }
 
     // =========================================================
@@ -86,7 +88,7 @@ public class ClientController : ControllerBase
             messageId,
             message.FromNodeId,
             message.ToNodeId,
-            message.Payload,  // ← Это EncryptedPayload
+            message.Payload,
             contentType);
 
         if (storedMessage == null)
@@ -340,7 +342,7 @@ public class ClientController : ControllerBase
             return NotFound(new { error = "Profile not found", nodeId });
         }
 
-        // 4. Запрашиваем у удалённой ноды
+        // 4. Запрашиваем у удалённой ноды через ProfileSyncService
         var gateway = _nodeRegistry.GetNode(gatewayId);
         if (gateway == null)
         {
@@ -348,32 +350,13 @@ public class ClientController : ControllerBase
             return NotFound(new { error = "Gateway not found", gatewayId });
         }
 
-        try
+        // ✅ Используем ProfileSyncService вместо прямого HttpClient
+        var remoteProfile = await _profileSync.PullProfileAsync(nodeId, gateway.PublicEndpoint);
+
+        if (remoteProfile != null)
         {
-            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-            var url = $"{gateway.PublicEndpoint}/client/profile/{nodeId}";
-
-            _logger.LogInformation("[GetProfile] Forwarding to: {Url}", url);
-
-            var response = await client.GetAsync(url);
-            if (response.IsSuccessStatusCode)
-            {
-                var json = await response.Content.ReadAsStringAsync();
-                var remoteProfile = JsonSerializer.Deserialize<ClientProfile>(json,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-
-                if (remoteProfile != null)
-                {
-                    _logger.LogInformation("[GetProfile] Found on remote: {DisplayName}", remoteProfile.DisplayName);
-                    return Ok(remoteProfile);
-                }
-            }
-
-            _logger.LogWarning("[GetProfile] Remote lookup failed: {Status}", response.StatusCode);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "[GetProfile] Remote request failed");
+            _logger.LogInformation("[GetProfile] Found on remote: {DisplayName}", remoteProfile.DisplayName);
+            return Ok(remoteProfile);
         }
 
         return NotFound(new { error = "Profile not found anywhere", nodeId });
@@ -437,8 +420,8 @@ public class ClientController : ControllerBase
 
     [HttpGet("search")]
     public async Task<IActionResult> SearchProfiles(
-    [FromQuery] string query,
-    [FromQuery] bool isFallback = false)  // ← Новый параметр
+        [FromQuery] string query,
+        [FromQuery] bool isFallback = false)
     {
         // ✅ Ищем в локальной БД
         var results = await _database.SearchProfilesAsync(query);
@@ -446,8 +429,7 @@ public class ClientController : ControllerBase
         _logger.LogInformation("Profile search: '{Query}' → {Count} results (local DB)",
             query, results.Count);
 
-        // ✅ FALLBACK: Только если это НЕ fallback запрос (чтобы избежать loop)
-        // И нашли мало результатов
+        // ✅ FALLBACK: Только если это НЕ fallback запрос
         if (!isFallback && results.Count < 5)
         {
             var aliveNodes = _nodeRegistry.GetAliveNodes()
@@ -459,25 +441,27 @@ public class ClientController : ControllerBase
             {
                 try
                 {
-                    var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
-                    // ← Добавляем &isFallback=true чтобы остановить рекурсию
+                    // ✅ Используем IHttpClientFactory вместо new HttpClient()
+                    var client = _httpClientFactory.CreateClient();
+                    client.Timeout = TimeSpan.FromSeconds(3);
+
                     var url = $"{node.PublicEndpoint}/client/search?query={Uri.EscapeDataString(query)}&isFallback=true";
 
                     var response = await client.GetAsync(url);
                     if (response.IsSuccessStatusCode)
                     {
                         var json = await response.Content.ReadAsStringAsync();
-                        var remoteResults = System.Text.Json.JsonSerializer.Deserialize<List<ClientProfile>>(json,
-                            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        var remoteResults = JsonSerializer.Deserialize<List<ClientProfile>>(json,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
                         if (remoteResults != null)
                         {
-                            foreach (var profile in remoteResults)
+                            foreach (var p in remoteResults)
                             {
-                                if (!results.Any(r => r.NodeId == profile.NodeId))
+                                if (!results.Any(r => r.NodeId == p.NodeId))
                                 {
-                                    await _database.SaveProfileAsync(profile);
-                                    results.Add(profile);
+                                    await _database.SaveProfileAsync(p);
+                                    results.Add(p);
                                 }
                             }
                         }
@@ -535,8 +519,18 @@ public class ClientController : ControllerBase
         {
             _logger.LogInformation("[Delivery] Message {MessageId} marked as delivered", messageId);
 
-            // Уведомляем отправителя о доставке
-            // (можно реализовать через NotifyClient если отправитель онлайн)
+            // ✅ Получаем сообщение чтобы узнать отправителя
+            var message = await _database.GetMessageAsync(messageId);
+            if (message != null)
+            {
+                // ✅ Уведомляем отправителя
+                await NotifyClient(message.FromNodeId, new
+                {
+                    type = "status_update",
+                    messageId,
+                    status = "Delivered"
+                });
+            }
         }
 
         return Ok(new { success, messageId, status = "Delivered" });
@@ -554,8 +548,16 @@ public class ClientController : ControllerBase
         {
             _logger.LogInformation("[Read] Message {MessageId} marked as read", messageId);
 
-            // Уведомляем отправителя о прочтении
-            // (можно реализовать через NotifyClient если отправитель онлайн)
+            var message = await _database.GetMessageAsync(messageId);
+            if (message != null)
+            {
+                await NotifyClient(message.FromNodeId, new
+                {
+                    type = "status_update",
+                    messageId,
+                    status = "Read"
+                });
+            }
         }
 
         return Ok(new { success, messageId, status = "Read" });
@@ -664,7 +666,7 @@ public class ClientMessage
     public string ToNodeId { get; set; } = string.Empty;
     public byte[] Payload { get; set; } = Array.Empty<byte>();
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
-    public int? ContentType { get; set; }  
+    public int? ContentType { get; set; }
 }
 
 public class ClientProfileRequest
