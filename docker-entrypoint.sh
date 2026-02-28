@@ -36,12 +36,10 @@ fi
 # 4. Parse BOOTSTRAP_NODES (comma-separated, can be empty)
 if [ -z "$BOOTSTRAP_NODES" ]; then
     echo "No bootstrap nodes provided. Checking DNS for sfdrn.qzz.io..."
-    # Пробуем получить IP адреса из домена (если он уже активен)
     DNS_IPS=$(dig +short sfdrn.qzz.io | grep -E '^[0-9.]+$' || true)
     
     if [ -n "$DNS_IPS" ]; then
         echo "Found nodes via DNS: $DNS_IPS"
-        # Формируем список URL из полученных IP
         NEIGHBORS_JSON=$(echo "$DNS_IPS" | jq -R -s -c 'split("\n") | map(select(length > 0) | "http://\(.):5000")')
     else
         echo "No nodes found via DNS. Starting as a potential pioneer."
@@ -52,16 +50,41 @@ else
     NEIGHBORS_JSON=$(echo "$BOOTSTRAP_NODES" | jq -R 'split(",") | map(select(length > 0))')
 fi
 
-# 5. Generate appsettings.json
+# 5. Database path configuration
+DB_PATH=${DB_PATH:-/app/data}
+mkdir -p "$DB_PATH"
+echo "Database path: $DB_PATH"
+
+# 6. Check existing database
+DB_FILE="$DB_PATH/sfdrn.db"
+if [ -f "$DB_FILE" ]; then
+    echo "Found existing database: $DB_FILE"
+    DB_SIZE=$(du -h "$DB_FILE" | cut -f1)
+    echo "Database size: $DB_SIZE"
+    
+    # Показаем статистику
+    PROFILE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM Profiles;" 2>/dev/null || echo "0")
+    MESSAGE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM Messages;" 2>/dev/null || echo "0")
+    echo "Profiles in DB: $PROFILE_COUNT"
+    echo "Messages in DB: $MESSAGE_COUNT"
+else
+    echo "No existing database found. Will be created on first run."
+fi
+
+# 7. Generate appsettings.json
 cat > /app/appsettings.json <<EOF
 {
   "Logging": {
     "LogLevel": {
       "Default": "Information",
-      "Microsoft.AspNetCore": "Warning"
+      "Microsoft.AspNetCore": "Warning",
+      "Microsoft.EntityFrameworkCore": "Warning"
     }
   },
   "AllowedHosts": "*",
+  "Database": {
+    "Path": "$DB_PATH"
+  },
   "Node": {
     "NodeId": "$NODE_ID",
     "Region": "$REGION",
@@ -76,12 +99,12 @@ echo "Configuration generated:"
 echo "  Node ID:   $NODE_ID"
 echo "  Region:    $REGION"
 echo "  Endpoint:  $PUBLIC_ENDPOINT"
+echo "  Database:  $DB_FILE"
 echo "  Bootstrap: ${BOOTSTRAP_NODES:-NONE (pioneer node)}"
 echo "=========================================="
 echo "Starting SFDRN node..."
 echo ""
 
-# Start the application
 # Force bind to all interfaces inside the container
 export ASPNETCORE_URLS="http://0.0.0.0:5000"
 

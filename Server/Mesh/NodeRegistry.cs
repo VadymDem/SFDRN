@@ -10,7 +10,6 @@ public class NodeRegistry
     private readonly NodeConfiguration _localConfig;
     private readonly ILogger<NodeRegistry>? _logger;
     private readonly object _lockObject = new();
-    private readonly Dictionary<string, ClientProfile> _clientProfiles = new();
     private readonly object _profilesLock = new();
 
     // [ID Клиента] -> [ID Ноды-шлюза]
@@ -48,6 +47,8 @@ public class NodeRegistry
     public void UpdateClientLocation(string clientId, string gatewayNodeId)
     {
         _clientToNodeMap[clientId] = gatewayNodeId;
+        _logger?.LogInformation("Client {ClientId} mapped to gateway {GatewayId}, total clients: {Total}",
+            clientId, gatewayNodeId, _clientToNodeMap.Count);
     }
 
     /// <summary>
@@ -55,24 +56,49 @@ public class NodeRegistry
     /// </summary>
     public void SyncClientMap(Dictionary<string, string> remoteClientMap)
     {
+        var added = 0;
         foreach (var (clientId, gatewayId) in remoteClientMap)
         {
-            // Обновляем только если это не наш локальный клиент (наша инфа приоритетнее)
-            // И если мы вообще знаем такую ноду-шлюз
-            if (gatewayId != _localConfig.NodeId && _nodes.ContainsKey(gatewayId))
-            {
-                _clientToNodeMap[clientId] = gatewayId;
-            }
+            // ✅ ПРОСТОЕ РЕШЕНИЕ: Всегда обновляем
+            _clientToNodeMap[clientId] = gatewayId;
+            added++;
         }
+
+        _logger?.LogInformation("SyncClientMap: added/updated {Count} clients, total: {Total}",
+            added, _clientToNodeMap.Count);
     }
 
     public string? GetClientGateway(string clientId)
     {
         _clientToNodeMap.TryGetValue(clientId, out var nodeId);
+
+        _logger?.LogInformation("GetClientGateway({ClientId}) = {Gateway}", clientId, nodeId ?? "NULL");
+
+        // Debug: покажем всю карту
+        _logger?.LogInformation("ClientMap contains {Count} clients:", _clientToNodeMap.Count);
+        foreach (var (c, g) in _clientToNodeMap.Take(10))
+        {
+            _logger?.LogInformation("  {Client} -> {Gateway}", c[..Math.Min(20, c.Length)], g);
+        }
+
         return nodeId;
     }
 
-    public Dictionary<string, string> GetClientMap() => _clientToNodeMap.ToDictionary(k => k.Key, v => v.Value);
+    /// <summary>
+    /// Получить endpoint ноды по её ID
+    /// </summary>
+    public string? GetNodeEndpoint(string nodeId)
+    {
+        var node = GetNode(nodeId);
+        return node?.PublicEndpoint;
+    }
+
+    public Dictionary<string, string> GetClientMap()
+    {
+        var map = _clientToNodeMap.ToDictionary(k => k.Key, v => v.Value);
+        _logger?.LogDebug("GetClientMap: returning {Count} clients", map.Count);
+        return map;
+    }
 
     // --- ЛОГИКА НОД ---
 
@@ -147,6 +173,12 @@ public class NodeRegistry
     public List<NodeInfo> GetAllNodes() { lock (_lockObject) return _nodes.Values.ToList(); }
 
     public List<NodeInfo> GetAliveNodes() { lock (_lockObject) return _nodes.Values.Where(n => n.Status == NodeStatus.Alive).ToList(); }
+
+    public void RemoveClientLocation(string clientId)
+    {
+        _clientToNodeMap.TryRemove(clientId, out _);
+        _logger?.LogInformation("Client {ClientId} removed from map", clientId);
+    }
 
     public void MarkNodeDead(string nodeId)
     {
@@ -240,108 +272,6 @@ public class NodeRegistry
                 }
             }
             return graph;
-        }
-    }
-
-    // =========================================================
-    // Профили клиентов (Distributed Phonebook)
-    // =========================================================
-
-    /// <summary>
-    /// Получить все профили для отправки соседям через Gossip
-    /// </summary>
-    public Dictionary<string, ClientProfile> GetProfiles()
-    {
-        lock (_profilesLock)
-        {
-            _logger?.LogInformation("GetProfiles called: returning {Count} profiles", _clientProfiles.Count);
-
-            foreach (var p in _clientProfiles.Take(5))
-            {
-                _logger?.LogInformation("  - {NodeId} (@{Nickname})", p.Value.NodeId, p.Value.GlobalNickname);
-            }
-
-            return _clientProfiles.ToDictionary(k => k.Key, v => v.Value);
-        }
-    }
-
-    public void UpdateClientProfile(ClientProfile profile)
-    {
-        lock (_profilesLock)
-        {
-            _clientProfiles[profile.NodeId] = profile;
-            _logger?.LogInformation("Profile stored in memory: {NodeId} (@{Nickname}), total: {Count}",
-                profile.NodeId, profile.GlobalNickname, _clientProfiles.Count);
-        }
-    }
-
-
-    /// <summary>
-    /// Синхронизация профилей из сети (через Gossip, Last-Write-Wins)
-    /// </summary>
-    public void SyncProfiles(Dictionary<string, ClientProfile> remoteProfiles)
-    {
-        if (remoteProfiles == null || remoteProfiles.Count == 0)
-        {
-            _logger?.LogDebug("SyncProfiles: received empty profile list");
-            return;
-        }
-
-        _logger?.LogInformation("SyncProfiles: received {Count} profiles to sync", remoteProfiles.Count);
-
-        lock (_profilesLock)
-        {
-            int updated = 0;
-            int skipped = 0;
-
-            foreach (var remote in remoteProfiles)
-            {
-                _logger?.LogDebug("Processing profile: {NodeId} (@{Nickname})",
-                    remote.Value.NodeId, remote.Value.GlobalNickname);
-
-                // Если у нас нет этого профиля ИЛИ профиль из сети новее - обновляем
-                if (!_clientProfiles.TryGetValue(remote.Key, out var local))
-                {
-                    _clientProfiles[remote.Key] = remote.Value;
-                    updated++;
-                    _logger?.LogInformation("Added new profile: {NodeId} (@{Nickname})",
-                        remote.Value.NodeId, remote.Value.GlobalNickname);
-                }
-                else if (remote.Value.LastUpdated > local.LastUpdated)
-                {
-                    _clientProfiles[remote.Key] = remote.Value;
-                    updated++;
-                    _logger?.LogInformation("Updated profile: {NodeId} (@{Nickname})",
-                        remote.Value.NodeId, remote.Value.GlobalNickname);
-                }
-                else
-                {
-                    skipped++;
-                }
-            }
-
-            _logger?.LogInformation("SyncProfiles complete: {Updated} updated, {Skipped} skipped, total {Total}",
-                updated, skipped, _clientProfiles.Count);
-        }
-    }
-
-    /// <summary>
-    /// Поиск профилей по nickname или имени
-    /// </summary>
-    public List<ClientProfile> SearchProfiles(string query)
-    {
-        if (string.IsNullOrWhiteSpace(query))
-            return new List<ClientProfile>();
-
-        string lowerQuery = query.ToLowerInvariant().Trim();
-
-        lock (_profilesLock)
-        {
-            return _clientProfiles.Values
-                .Where(p => p.GlobalNickname.Contains(lowerQuery) ||
-                            p.DisplayName.ToLowerInvariant().Contains(lowerQuery))
-                .Take(50)
-                .ToList();
         }
     }
 

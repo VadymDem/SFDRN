@@ -1,8 +1,11 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using SFDRN.Server.Database.Models;
 using SFDRN.Server.Mesh;
 using SFDRN.Server.Models;
 using SFDRN.Server.Routing;
+using SFDRN.Server.Services;
 using SFDRN.Server.Storage;
+using System.Net.Mime;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -17,6 +20,8 @@ public class ClientController : ControllerBase
     private readonly PacketStorage _packetStorage;
     private readonly NodeRegistry _nodeRegistry;
     private readonly ILogger<ClientController> _logger;
+    private readonly DatabaseService _database;
+    private readonly ProfileSyncService _profileSync;
 
     // ✅ Активные WebSocket соединения клиентов
     private static readonly Dictionary<string, WebSocket> _clientConnections = new();
@@ -26,12 +31,16 @@ public class ClientController : ControllerBase
         RoutingEngine routingEngine,
         PacketStorage packetStorage,
         NodeRegistry nodeRegistry,
-        ILogger<ClientController> logger)
+        ILogger<ClientController> logger,
+        DatabaseService database,           // ✅ Добавлено
+        ProfileSyncService profileSync)     // ✅ Добавлено
     {
         _routingEngine = routingEngine;
         _packetStorage = packetStorage;
         _nodeRegistry = nodeRegistry;
         _logger = logger;
+        _database = database;               // ✅ Добавлено
+        _profileSync = profileSync;         // ✅ Добавлено
     }
 
     // =========================================================
@@ -61,44 +70,117 @@ public class ClientController : ControllerBase
     [HttpPost("send")]
     public async Task<IActionResult> SendMessage([FromBody] ClientMessage message)
     {
+        _logger.LogInformation("═══════════════════════════════════");
+        _logger.LogInformation("[Send] MessageId: {MessageId}", message.MessageId);
+        _logger.LogInformation("[Send] From: {From}", message.FromNodeId);
+        _logger.LogInformation("[Send] To: {To}", message.ToNodeId);
+        _logger.LogInformation("[Send] LocalNodeId: {Local}", _nodeRegistry.LocalNodeId);
+
+        var messageId = message.MessageId ?? Guid.NewGuid().ToString();
+        var contentType = (MessageType)(message.ContentType ?? 0);
+
+        // ═════════════════════════════════════════════════════════
+        // ✅ PHASE 1.1: СОХРАНЯЕМ В БД СО СТАТУСОМ ReceivedByNode
+        // ═════════════════════════════════════════════════════════
+        var storedMessage = await _database.SaveMessageAsync(
+            messageId,
+            message.FromNodeId,
+            message.ToNodeId,
+            message.Payload,  // ← Это EncryptedPayload
+            contentType);
+
+        if (storedMessage == null)
+        {
+            _logger.LogError("[Send] ❌ Failed to save message to DB");
+            return StatusCode(500, new { success = false, error = "Failed to store message" });
+        }
+
+        // Обновляем статус на Stored
+        await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Stored);
+        _logger.LogInformation("[Send] ✅ Saved to DB: {MessageId}", messageId);
+
         var packet = new PacketEnvelope
         {
-            PacketId = message.MessageId ?? Guid.NewGuid().ToString(),
+            PacketId = messageId,
             SourceNode = message.FromNodeId,
             DestinationNode = message.ToNodeId,
             EncryptedPayload = message.Payload,
             Ttl = 10
         };
 
-        // 1. Проверяем, не наш ли это клиент (WebSocket)
+        // 1. Проверяем WebSocket соединение
         if (_clientConnections.ContainsKey(message.ToNodeId))
         {
+            _logger.LogInformation("[Send] Found WebSocket connection for {To}", message.ToNodeId);
             _packetStorage.StorePacket(packet);
-            await NotifyClient(message.ToNodeId, new { type = "new_message", from = packet.SourceNode });
-            return Ok(new { success = true });
+
+            // ✅ Обновляем статус на Forwarded
+            await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Forwarded);
+
+            await NotifyClient(message.ToNodeId, new
+            {
+                type = "new_message",
+                messageId,
+                from = packet.SourceNode
+            });
+
+            return Ok(new { success = true, method = "websocket", messageId });
         }
 
         // 2. Ищем, на какой ноде сидит клиент
         var gatewayId = _nodeRegistry.GetClientGateway(message.ToNodeId);
 
+        _logger.LogInformation("[Send] GetClientGateway({To}) = {Gateway}", message.ToNodeId, gatewayId ?? "NULL");
+
         if (gatewayId != null)
         {
-            // Клиент на другой ноде — шлем туда через меш
+            if (gatewayId == _nodeRegistry.LocalNodeId)
+            {
+                _logger.LogInformation("[Send] ⚠️ Gateway is LOCAL, storing locally");
+                _packetStorage.StorePacket(packet);
+                return Ok(new { success = true, method = "local", messageId });
+            }
+
+            _logger.LogInformation("[Send] ✅ Routing to gateway {Gateway}", gatewayId);
             var result = await _routingEngine.RouteToClient(gatewayId, packet);
-            return Ok(new { success = result });
+
+            if (result)
+            {
+                // ✅ Обновляем статус на Forwarded
+                await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Forwarded);
+            }
+
+            return Ok(new { success = result, method = "mesh", gateway = gatewayId, messageId });
         }
 
-        // 3. Если вообще не знаем клиента — Flooding (рассылка всем живым нодам)
-        _logger.LogWarning("Unknown client {To}. Flooding to all neighbors.", message.ToNodeId);
-        var aliveNodes = _nodeRegistry.GetAliveNodes().Where(n => n.NodeId != _nodeRegistry.LocalNodeId);
+        // 3. Не знаем клиента - flooding
+        _logger.LogWarning("[Send] ❓ Unknown client, flooding");
 
-        foreach (var node in aliveNodes)
+        var aliveNodes = _nodeRegistry.GetAliveNodes()
+            .Where(n => n.NodeId != _nodeRegistry.LocalNodeId)
+            .ToList();
+
+        _logger.LogInformation("[Send] Alive neighbors: {Count}", aliveNodes.Count);
+
+        if (aliveNodes.Any())
         {
-            _ = _routingEngine.TryForward(node.PublicEndpoint, packet); // Пожар и забыл
+            foreach (var node in aliveNodes)
+            {
+                _logger.LogInformation("[Send] Flooding to {NodeId}: {Endpoint}", node.NodeId, node.PublicEndpoint);
+                _ = _routingEngine.TryForward(node.PublicEndpoint, packet);
+            }
+
+            // ✅ Обновляем статус на Forwarded
+            await _database.UpdateMessageStatusAsync(messageId, MessageStatus.Forwarded);
+
+            return Ok(new { success = true, method = "flood", neighbors = aliveNodes.Count, messageId });
         }
 
-        return Ok(new { success = true, status = "broadcasted" });
+        // 4. Нет соседей - сохраняем offline
+        _packetStorage.StorePacket(packet);
+        return Ok(new { success = true, method = "stored_offline", messageId });
     }
+
 
     // =========================================================
     // Get Messages (HTTP Polling)
@@ -114,7 +196,8 @@ public class ClientController : ControllerBase
             FromNodeId = p.SourceNode,
             ToNodeId = p.DestinationNode,
             Payload = p.EncryptedPayload,
-            Timestamp = p.CreatedAt
+            Timestamp = p.CreatedAt,
+            ContentType = 0  // ← Default: Text
         }).ToList();
 
         _logger.LogInformation("Retrieved {Count} messages for {NodeId}",
@@ -212,8 +295,88 @@ public class ClientController : ControllerBase
                 _clientConnections.Remove(nodeId);
             }
 
+            // ✅ Удаляем из ClientMap при отключении
+            _nodeRegistry.RemoveClientLocation(nodeId);
+
             _logger.LogInformation("WebSocket disconnected: {NodeId}", nodeId);
         }
+    }
+
+    /// <summary>
+    /// Получить профиль клиента по NodeId (ищет по всей сети)
+    /// </summary>
+    [HttpGet("profile/{nodeId}")]
+    public async Task<IActionResult> GetProfile(string nodeId)
+    {
+        _logger.LogInformation("[GetProfile] Looking for: {NodeId}", nodeId);
+
+        // 1. Ищем локально
+        var profile = await _database.GetProfileAsync(nodeId);
+        if (profile != null)
+        {
+            _logger.LogInformation("[GetProfile] Found locally: {DisplayName}", profile.DisplayName);
+            return Ok(new ClientProfile
+            {
+                NodeId = profile.NodeId,
+                DisplayName = profile.DisplayName,
+                GlobalNickname = profile.GlobalNickname,
+                Status = profile.Status,
+                LastUpdated = profile.LastUpdated
+            });
+        }
+
+        // 2. Ищем gateway клиента
+        var gatewayId = _nodeRegistry.GetClientGateway(nodeId);
+        if (string.IsNullOrEmpty(gatewayId))
+        {
+            _logger.LogWarning("[GetProfile] Client not found in ClientMap: {NodeId}", nodeId);
+            return NotFound(new { error = "Client not found", nodeId });
+        }
+
+        // 3. Если клиент на этой ноде но профиля нет
+        if (gatewayId == _nodeRegistry.LocalNodeId)
+        {
+            _logger.LogWarning("[GetProfile] Client is local but no profile: {NodeId}", nodeId);
+            return NotFound(new { error = "Profile not found", nodeId });
+        }
+
+        // 4. Запрашиваем у удалённой ноды
+        var gateway = _nodeRegistry.GetNode(gatewayId);
+        if (gateway == null)
+        {
+            _logger.LogWarning("[GetProfile] Gateway not found: {GatewayId}", gatewayId);
+            return NotFound(new { error = "Gateway not found", gatewayId });
+        }
+
+        try
+        {
+            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var url = $"{gateway.PublicEndpoint}/client/profile/{nodeId}";
+
+            _logger.LogInformation("[GetProfile] Forwarding to: {Url}", url);
+
+            var response = await client.GetAsync(url);
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync();
+                var remoteProfile = JsonSerializer.Deserialize<ClientProfile>(json,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                if (remoteProfile != null)
+                {
+                    _logger.LogInformation("[GetProfile] Found on remote: {DisplayName}", remoteProfile.DisplayName);
+                    return Ok(remoteProfile);
+                }
+            }
+
+            _logger.LogWarning("[GetProfile] Remote lookup failed: {Status}", response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[GetProfile] Remote request failed");
+        }
+
+        return NotFound(new { error = "Profile not found anywhere", nodeId });
     }
 
     // =========================================================
@@ -248,11 +411,8 @@ public class ClientController : ControllerBase
     }
 
 
-    // =========================================================
-    // Profile & Discovery
-    // =========================================================
     [HttpPost("profile")]
-    public IActionResult PublishProfile([FromBody] ClientProfileRequest request)
+    public async Task<IActionResult> PublishProfile([FromBody] ClientProfileRequest request)
     {
         var profile = new ClientProfile
         {
@@ -263,29 +423,227 @@ public class ClientController : ControllerBase
             LastUpdated = DateTime.UtcNow
         };
 
-        _nodeRegistry.UpdateClientProfile(profile);
+        // ✅ Сохраняем в БД вместо in-memory
+        var saved = await _database.SaveProfileAsync(profile);
 
-        _logger.LogInformation("Profile published: {NodeId} (@{Nickname}) - {Status}",
-            profile.NodeId, profile.GlobalNickname, profile.Status);
+        if (saved)
+        {
+            _logger.LogInformation("Profile published: {NodeId} (@{Nickname}) - {Status}",
+                profile.NodeId, profile.GlobalNickname, profile.Status);
+        }
 
-        return Ok(new { success = true });
+        return Ok(new { success = saved });
     }
 
     [HttpGet("search")]
-    public IActionResult SearchProfiles([FromQuery] string query)
+    public async Task<IActionResult> SearchProfiles(
+    [FromQuery] string query,
+    [FromQuery] bool isFallback = false)  // ← Новый параметр
     {
-        var results = _nodeRegistry.SearchProfiles(query);
+        // ✅ Ищем в локальной БД
+        var results = await _database.SearchProfilesAsync(query);
 
-        _logger.LogInformation("Profile search: '{Query}' → {Count} results",
+        _logger.LogInformation("Profile search: '{Query}' → {Count} results (local DB)",
             query, results.Count);
+
+        // ✅ FALLBACK: Только если это НЕ fallback запрос (чтобы избежать loop)
+        // И нашли мало результатов
+        if (!isFallback && results.Count < 5)
+        {
+            var aliveNodes = _nodeRegistry.GetAliveNodes()
+                .Where(n => n.NodeId != _nodeRegistry.LocalNodeId)
+                .Take(3)
+                .ToList();
+
+            foreach (var node in aliveNodes)
+            {
+                try
+                {
+                    var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+                    // ← Добавляем &isFallback=true чтобы остановить рекурсию
+                    var url = $"{node.PublicEndpoint}/client/search?query={Uri.EscapeDataString(query)}&isFallback=true";
+
+                    var response = await client.GetAsync(url);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var json = await response.Content.ReadAsStringAsync();
+                        var remoteResults = System.Text.Json.JsonSerializer.Deserialize<List<ClientProfile>>(json,
+                            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                        if (remoteResults != null)
+                        {
+                            foreach (var profile in remoteResults)
+                            {
+                                if (!results.Any(r => r.NodeId == profile.NodeId))
+                                {
+                                    await _database.SaveProfileAsync(profile);
+                                    results.Add(profile);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Failed to query neighbor {NodeId} for profiles: {Error}",
+                        node.NodeId, ex.Message);
+                }
+            }
+
+            _logger.LogInformation("Profile search with fallback: '{Query}' → {Count} total results",
+                query, results.Count);
+        }
 
         return Ok(results);
     }
+
+    // === 1.1 MESSAGE RECEIPT CHAIN ===
+
+    /// <summary>
+    /// Получить статус сообщения
+    /// </summary>
+    [HttpGet("message/{messageId}/status")]
+    public async Task<IActionResult> GetMessageStatus(string messageId)
+    {
+        var status = await _database.GetMessageStatusAsync(messageId);
+        var history = await _database.GetMessageStatusHistoryAsync(messageId);
+
+        return Ok(new
+        {
+            messageId,
+            status = status.ToString(),
+            statusValue = (int)status,
+            history = history.Select(h => new
+            {
+                status = h.Status.ToString(),
+                timestamp = h.Timestamp,
+                nodeId = h.NodeId,
+                details = h.Details
+            })
+        });
+    }
+
+    /// <summary>
+    /// Пометить сообщение как доставленное (вызывается клиентом при получении)
+    /// </summary>
+    [HttpPost("message/{messageId}/delivered")]
+    public async Task<IActionResult> MarkDelivered(string messageId, [FromBody] DeliveryAckRequest? request)
+    {
+        var success = await _database.MarkMessageDeliveredAsync(messageId, request?.NodeId);
+
+        if (success)
+        {
+            _logger.LogInformation("[Delivery] Message {MessageId} marked as delivered", messageId);
+
+            // Уведомляем отправителя о доставке
+            // (можно реализовать через NotifyClient если отправитель онлайн)
+        }
+
+        return Ok(new { success, messageId, status = "Delivered" });
+    }
+
+    /// <summary>
+    /// Пометить сообщение как прочитанное
+    /// </summary>
+    [HttpPost("message/{messageId}/read")]
+    public async Task<IActionResult> MarkRead(string messageId, [FromBody] ReadAckRequest? request)
+    {
+        var success = await _database.MarkMessageReadAsync(messageId, request?.NodeId);
+
+        if (success)
+        {
+            _logger.LogInformation("[Read] Message {MessageId} marked as read", messageId);
+
+            // Уведомляем отправителя о прочтении
+            // (можно реализовать через NotifyClient если отправитель онлайн)
+        }
+
+        return Ok(new { success, messageId, status = "Read" });
+    }
+
+    /// <summary>
+    /// Batch mark messages as read
+    /// </summary>
+    [HttpPost("messages/read")]
+    public async Task<IActionResult> MarkMultipleRead([FromBody] BatchReadRequest request)
+    {
+        var results = new List<object>();
+
+        foreach (var messageId in request.MessageIds)
+        {
+            var success = await _database.MarkMessageReadAsync(messageId);
+            results.Add(new { messageId, success });
+        }
+
+        return Ok(new { processed = results.Count, results });
+    }
+
+    // === 1.2 TTL & STATS ===
+
+    /// <summary>
+    /// Получить статистику сообщений на ноде
+    /// </summary>
+    [HttpGet("messages/stats")]
+    public async Task<IActionResult> GetMessageStats()
+    {
+        var stats = await _database.GetMessageStatsAsync();
+        return Ok(stats);
+    }
+
+    /// <summary>
+    /// Принудительно запустить очистку просроченных сообщений (admin)
+    /// </summary>
+    [HttpPost("messages/cleanup")]
+    public async Task<IActionResult> CleanupExpiredMessages()
+    {
+        var count = await _database.CleanupExpiredMessagesAsync();
+        return Ok(new { cleaned = count, timestamp = DateTime.UtcNow });
+    }
+
+    /// <summary>
+    /// Получить pending сообщения с информацией о TTL
+    /// </summary>
+    [HttpGet("messages/{nodeId}/pending")]
+    public async Task<IActionResult> GetPendingMessages(string nodeId)
+    {
+        var messages = await _database.GetUndeliveredMessagesAsync(nodeId);
+
+        return Ok(new
+        {
+            nodeId,
+            count = messages.Count,
+            messages = messages.Select(m => new
+            {
+                messageId = m.MessageId,
+                from = m.FromNodeId,
+                status = m.Status.ToString(),
+                timestamp = m.Timestamp,
+                storedAt = m.StoredAt,
+                ttlSeconds = m.TtlSeconds,
+                expiresAt = m.StoredAt.AddSeconds(m.TtlSeconds),
+                contentType = m.ContentType.ToString()
+            })
+        });
+    }
 }
 
-// =========================================================
-// Models
-// =========================================================
+// === MODELS ===
+
+public class DeliveryAckRequest
+{
+    public string? NodeId { get; set; }
+}
+
+public class ReadAckRequest
+{
+    public string? NodeId { get; set; }
+}
+
+public class BatchReadRequest
+{
+    public List<string> MessageIds { get; set; } = new();
+}
+
 public class ClientRegistration
 {
     public string? DeviceId { get; set; }
@@ -306,6 +664,7 @@ public class ClientMessage
     public string ToNodeId { get; set; } = string.Empty;
     public byte[] Payload { get; set; } = Array.Empty<byte>();
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+    public int? ContentType { get; set; }  
 }
 
 public class ClientProfileRequest

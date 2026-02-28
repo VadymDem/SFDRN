@@ -260,30 +260,38 @@ public class RoutingEngine
 
     public async Task<bool> RouteToClient(string targetGatewayId, PacketEnvelope packet)
     {
-        // Если целевая нода — это мы сами, значит клиент подключен к нам
+        // ✅ Если целевая нода — это мы сами, доставляем локально
         if (targetGatewayId == _nodeRegistry.LocalNodeId)
         {
-            // Логика доставки клиенту (через WebSocket) уже должна быть в контроллере
-            // Но для надежности можно вызвать RoutePacket, он поймет, что это Local
-            var res = await RoutePacket(packet);
-            return res.Success;
+            _logger.LogInformation("Packet {PacketId} delivered locally (gateway is local)",
+                packet.PacketId);
+
+            // Сохраняем для клиента
+            _packetStorage.StorePacket(packet);
+            return true;
         }
 
-        // Если клиент на другой ноде, просим Дейкстру найти путь до ЭТОЙ НОДЫ
-        // Мы создаем "транзитный" поиск: Destination остается клиентским для финальной доставки, 
-        // но путь мы ищем до шлюза.
-
+        // ✅ Ищем путь до ШЛЮЗА (не клиента!)
         _logger.LogInformation("Routing packet {PacketId} to gateway {GatewayId} for client {Client}",
             packet.PacketId, targetGatewayId, packet.DestinationNode);
 
-        // Вызываем поиск следующего прыжка до ШЛЮЗА
+        // Ищем следующий прыжок до ноды-шлюза
         var nextHop = FindNextHop(_nodeRegistry.LocalNodeId, targetGatewayId);
 
-        if (nextHop == null) return false;
+        if (nextHop == null)
+        {
+            _logger.LogWarning("No route to gateway {GatewayId}", targetGatewayId);
+            return false;
+        }
 
         var node = _nodeRegistry.GetNode(nextHop);
-        if (node == null) return false;
+        if (node == null)
+        {
+            _logger.LogWarning("Gateway node {NextHop} not found in registry", nextHop);
+            return false;
+        }
 
+        _logger.LogInformation("Forwarding packet {PacketId} via {NextHop}", packet.PacketId, nextHop);
         return await TryForward(node.PublicEndpoint, packet);
     }
 
