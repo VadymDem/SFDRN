@@ -7,7 +7,6 @@ namespace SFDRN.Server.Routing;
 
 /// <summary>
 /// Движок маршрутизации сообщений между нодами
-/// Использует абстракцию транспорта вместо прямых HTTP вызовов
 /// </summary>
 public class RoutingEngine
 {
@@ -29,31 +28,77 @@ public class RoutingEngine
     }
 
     /// <summary>
-    /// Маршрутизировать пакет (основной метод для контроллеров)
+    /// Маршрутизировать пакет
     /// </summary>
     public async Task<RouteResult> RoutePacket(PacketEnvelope packet)
     {
         _logger.LogInformation("[Routing] RoutePacket: {PacketId} {Source} → {Destination}",
             packet.PacketId, packet.SourceNode, packet.DestinationNode);
 
-        // 1. Проверяем ClientMap - может получатель наш клиент?
-        var clientGateway = _nodeRegistry.GetClientGateway(packet.DestinationNode);
-
-        if (clientGateway == _nodeRegistry.LocalNodeId)
+        // ═════════════════════════════════════════════════════════
+        // ✅ 1. СНАЧАЛА: Мы получатель? (destination = local node)
+        // ═════════════════════════════════════════════════════════
+        if (packet.DestinationNode == _nodeRegistry.LocalNodeId)
         {
-            // Клиент подключен к этой ноде
-            _logger.LogInformation("[Routing] Client is local: {ClientId}", packet.DestinationNode);
+            _logger.LogInformation("[Routing] Destination is LOCAL NODE, storing");
+            _packetStorage.StorePacket(packet);
             return new RouteResult
             {
                 Success = true,
-                Message = "Client is local",
+                Message = "Delivered locally to node",
                 Method = "local"
             };
         }
 
-        // 2. Если знаем gateway клиента
+        // ═════════════════════════════════════════════════════════
+        // ✅ 2. Защита от loop: source == destination
+        // ═════════════════════════════════════════════════════════
+        if (packet.SourceNode == packet.DestinationNode)
+        {
+            _logger.LogWarning("[Routing] Loop detected: source == destination");
+            return new RouteResult
+            {
+                Success = false,
+                Message = "Loop detected",
+                Method = "error"
+            };
+        }
+
+        // ═════════════════════════════════════════════════════════
+        // ✅ 3. Проверяем ClientMap - клиент на этой ноде?
+        // ═════════════════════════════════════════════════════════
+        var clientGateway = _nodeRegistry.GetClientGateway(packet.DestinationNode);
+
+        if (clientGateway == _nodeRegistry.LocalNodeId)
+        {
+            _logger.LogInformation("[Routing] Client is local: {ClientId}", packet.DestinationNode);
+            _packetStorage.StorePacket(packet);
+            return new RouteResult
+            {
+                Success = true,
+                Message = "Delivered to local client",
+                Method = "local_client"
+            };
+        }
+
+        // ═════════════════════════════════════════════════════════
+        // ✅ 4. Знаем gateway клиента?
+        // ═════════════════════════════════════════════════════════
         if (!string.IsNullOrEmpty(clientGateway))
         {
+            // Защита: не отправляем сами себе
+            if (clientGateway == _nodeRegistry.LocalNodeId)
+            {
+                _logger.LogWarning("[Routing] Gateway is self, storing locally");
+                _packetStorage.StorePacket(packet);
+                return new RouteResult
+                {
+                    Success = true,
+                    Message = "Gateway is local",
+                    Method = "local"
+                };
+            }
+
             _logger.LogInformation("[Routing] Routing to gateway: {Gateway}", clientGateway);
             var success = await RouteToClient(clientGateway, packet);
             return new RouteResult
@@ -65,22 +110,25 @@ public class RoutingEngine
             };
         }
 
-        // 3. Если получатель - эта нода
-        if (packet.DestinationNode == _nodeRegistry.LocalNodeId)
-        {
-            _logger.LogInformation("[Routing] Destination is local node");
-            return new RouteResult
-            {
-                Success = true,
-                Message = "Delivered locally",
-                Method = "local"
-            };
-        }
-
-        // 4. Проверяем, может получатель - известная нода
+        // ═════════════════════════════════════════════════════════
+        // ✅ 5. Это известная нода?
+        // ═════════════════════════════════════════════════════════
         var targetNode = _nodeRegistry.GetNode(packet.DestinationNode);
         if (targetNode != null)
         {
+            // Защита: не отправляем сами себе
+            if (targetNode.NodeId == _nodeRegistry.LocalNodeId)
+            {
+                _logger.LogWarning("[Routing] Would forward to self, storing locally");
+                _packetStorage.StorePacket(packet);
+                return new RouteResult
+                {
+                    Success = true,
+                    Message = "Self-delivery",
+                    Method = "local"
+                };
+            }
+
             _logger.LogInformation("[Routing] Target is known node: {NodeId}", packet.DestinationNode);
             var success = await TryForward(targetNode.PublicEndpoint, packet);
             return new RouteResult
@@ -91,7 +139,9 @@ public class RoutingEngine
             };
         }
 
-        // 5. Flood на все соседние ноды
+        // ═════════════════════════════════════════════════════════
+        // ✅ 6. Flood на соседей
+        // ═════════════════════════════════════════════════════════
         _logger.LogInformation("[Routing] Unknown destination, flooding");
         var sentCount = await FloodAsync(packet);
 
@@ -140,7 +190,6 @@ public class RoutingEngine
         var message = NodeMessage.FromPacket(packet);
         message.MessageId = packet.PacketId ?? Guid.NewGuid().ToString();
 
-        // Создаём endpoint из URL
         var endpoint = ParseEndpoint(targetEndpoint);
         if (endpoint == null)
         {
@@ -172,26 +221,6 @@ public class RoutingEngine
         _logger.LogInformation("[Routing] Flood complete: {Count} nodes", sentCount);
 
         return sentCount;
-    }
-
-    /// <summary>
-    /// Найти маршрут до клиента
-    /// </summary>
-    public async Task<string?> FindRouteAsync(string targetNodeId)
-    {
-        // Сначала проверяем локальную карту
-        var gateway = _nodeRegistry.GetClientGateway(targetNodeId);
-        if (!string.IsNullOrEmpty(gateway))
-        {
-            _logger.LogDebug("[Routing] Found in ClientMap: {Target} → {Gateway}", targetNodeId, gateway);
-            return gateway;
-        }
-
-        // Если не нашли - можно запросить у соседей (DHT-style)
-        // TODO: Реализовать поиск маршрута через соседние ноды
-
-        _logger.LogDebug("[Routing] No route found for {Target}", targetNodeId);
-        return null;
     }
 
     /// <summary>
