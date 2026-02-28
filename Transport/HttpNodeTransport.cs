@@ -30,7 +30,7 @@ public class HttpNodeTransport : Interfaces
     {
         try
         {
-            var url = $"{node.BaseUrl}/api/node/receive";
+            var url = $"{node.BaseUrl}/routing/receive";
 
             _logger?.LogDebug("[Transport] HTTP Send to {Url}: {MessageId}", url, message.MessageId);
 

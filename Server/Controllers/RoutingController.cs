@@ -5,6 +5,7 @@ using SFDRN.Server.Models;
 using SFDRN.Server.Routing;
 using SFDRN.Server.Services;
 using SFDRN.Server.Storage;
+using SFDRN.Server.Transport;
 
 namespace SFDRN.Server.Controllers;
 
@@ -163,6 +164,23 @@ public class RoutingController : ControllerBase
             $"Routing failed: {result.Message}");
 
         return BadRequest(result);
+    }
+
+    [HttpPost("receive")]
+    public async Task<IActionResult> Receive([FromBody] NodeMessage message)
+    {
+        // Конвертируем NodeMessage → PacketEnvelope
+        var packet = new PacketEnvelope
+        {
+            PacketId = message.MessageId ?? message.PacketId ?? Guid.NewGuid().ToString(),
+            SourceNode = message.FromNodeId,
+            DestinationNode = message.ToNodeId,
+            EncryptedPayload = message.Payload,
+            Ttl = message.Ttl,
+            CreatedAt = message.Timestamp
+        };
+
+        return await Forward(packet);
     }
 
     private async Task SendAck(PacketEnvelope original)
